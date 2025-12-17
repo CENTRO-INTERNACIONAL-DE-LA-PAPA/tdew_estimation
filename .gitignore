@@ -1,0 +1,72 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+*.pyd
+*.so
+*.dylib
+*.dll
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.pytype/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.log
+
+# Packaging / build
+build/
+dist/
+wheels/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.conda/
+*.conda
+
+# Jupyter / notebooks
+.ipynb_checkpoints/
+.notebook/
+
+# IDE / editor
+.vscode/
+.idea/
+*.iml
+
+# OS junk
+.DS_Store
+.DS_Store?
+Thumbs.db
+
+# Secrets / local config
+.env
+.env.*
+*.pem
+*.key
+
+# Large data + outputs (project-specific)
+results/
+output/
+outputs/
+data/
+datasets/
+*.parquet
+*.feather
+*.arrow
+*.zarr
+*.nc
+*.h5
+*.hdf5
+*.tif
+*.tiff
+
+# Dask artifacts
+dask-worker-space/

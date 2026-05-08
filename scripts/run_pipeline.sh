@@ -1,34 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# End-to-end pipeline runner for tdew_estimation anomaly model
-#
-# Steps:
-#  1) Compute daily climatology (TD_clim, TMIN_clim)
-#  2) Train anomaly coefficients at scale with Dask (chunks + combined parquet)
-#  3) Check for incomplete DOYs (actual ID count != expected)
-#  4) If needed: rerun only failed DOYs with Dask -> patch parquet
-#  5) Patch combined coefficients parquet inplace and re-check
-#
-# This script is intentionally "bash-first" and uses small Python one-liners to call
-# the library functions. It assumes you run it from the repository root.
-#
-# Requirements:
-#  - python environment with: dask[distributed], pandas, pyarrow, statsmodels, tqdm
-#  - input monthly parquet files under:
-#      ${BASE}/td/Outputs/td_daily_YYYY_MM.parquet
-#      ${BASE}/tmin_v1/Outputs/tmin_daily_YYYY_MM.parquet (legacy naming supported)
-#
-# Example:
-#   bash tdew_estimation/scripts/run_pipeline.sh \
-#     --base /path/to/base \
-#     --results /path/to/results \
-#     --grid /path/to/grid.dbf \
-#     --n-workers 8 --threads 4 --mem 16GB --batch-size 1000
-#
-# Tip:
-#   Use DRY_RUN=1 to print resolved settings without running heavy steps.
-
 usage() {
   cat <<'USAGE'
 Usage:
@@ -36,7 +8,7 @@ Usage:
 
 Required:
   --base PATH        Base directory containing td/Outputs and tmin_v1/Outputs
-  --results PATH     Results directory for outputs (climatology, chunks, coeffs, patch)
+  --results PATH     Results directory for outputs
   --grid PATH        Grid file with ID column (dbf/shp/gpkg/geojson/csv/parquet)
 
 Options (training years / hyperparams):
@@ -50,7 +22,16 @@ Options (Dask local cluster settings):
   --n-workers N        (default: 8)
   --threads N          (default: 4)
   --mem STR            (default: 16GB)
-  --batch-size N       (default: 1000)
+  --batch-size N       (default: 64)   bucket tasks submitted at once
+
+Options (bucketed dataset layout):
+  --num-buckets N      (default: 1024)
+  --prepared-dir DIR   (default: bucketed_training_data)
+  --clim-buckets DIR   (default: climatology_by_bucket)
+  --coeffs-dir DIR     (default: llr_coeffs_anomaly_dataset)
+  --patch-dir DIR      (default: llr_coeffs_anomaly_patch_dataset)
+  --failures-dir DIR   (default: anomaly_failures)
+  --patch-failures DIR (default: anomaly_patch_failures)
 
 Options (paths / filenames):
   --id-col NAME        (default: ID)
@@ -59,24 +40,23 @@ Options (paths / filenames):
   --tmin-var NAME      (default: tmin_v1)
   --outputs-subdir STR (default: Outputs)
   --climatology FILE   (default: daily_climatology.parquet)
-  --chunks-dir DIR     (default: anomaly_coeffs_chunks)
-  --coeffs FILE        (default: llr_coeffs_anomaly_final_direct.parquet)
-  --patch FILE         (default: llr_coeffs_anomaly_patch_doys.parquet)
 
 Flags:
-  --overwrite-chunks   Overwrite existing chunk files (default: false)
-  --skip-climatology   Do not compute climatology even if missing (default: false)
-  --skip-train         Do not train coefficients (default: false)
-  --skip-patch         Do not patch even if failures exist (default: false)
-  -h, --help           Show help
+  --overwrite-prepared       Rebuild monthly bucketed training shards
+  --overwrite-clim-buckets   Rebuild climatology bucket shards
+  --overwrite-train-output   Overwrite coefficient dataset output
+  --skip-climatology         Skip climatology computation
+  --skip-prepare            Skip building bucketed training inputs
+  --skip-train              Skip bucketed model fitting
+  --skip-patch              Skip rerun/patch workflow
+  -h, --help                Show help
 
 Environment:
-  DRY_RUN=1            Print config and exit
+  DRY_RUN=1                 Print config and exit
 
 USAGE
 }
 
-# Defaults
 BASE=""
 RESULTS=""
 GRID=""
@@ -90,7 +70,9 @@ MIN_SAMPLES=15
 N_WORKERS=8
 THREADS=4
 MEM="16GB"
-BATCH_SIZE=1000
+BATCH_SIZE=64
+
+NUM_BUCKETS=1024
 
 ID_COL="ID"
 DOY_COL="doy"
@@ -99,16 +81,21 @@ TMIN_VAR="tmin_v1"
 OUTPUTS_SUBDIR="Outputs"
 
 CLIMATOLOGY_FILE="daily_climatology.parquet"
-CHUNKS_DIR="anomaly_coeffs_chunks"
-COEFFS_FILE="llr_coeffs_anomaly_final_direct.parquet"
-PATCH_FILE="llr_coeffs_anomaly_patch_doys.parquet"
+PREPARED_DIR="bucketed_training_data"
+CLIM_BUCKETS_DIR="climatology_by_bucket"
+COEFFS_DIR="llr_coeffs_anomaly_dataset"
+PATCH_DIR="llr_coeffs_anomaly_patch_dataset"
+FAILURES_DIR="anomaly_failures"
+PATCH_FAILURES_DIR="anomaly_patch_failures"
 
-OVERWRITE_CHUNKS=0
+OVERWRITE_PREPARED=0
+OVERWRITE_CLIM_BUCKETS=0
+OVERWRITE_TRAIN_OUTPUT=0
 SKIP_CLIMATOLOGY=0
+SKIP_PREPARE=0
 SKIP_TRAIN=0
 SKIP_PATCH=0
 
-# Parse args
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --base) BASE="${2:-}"; shift 2;;
@@ -126,19 +113,26 @@ while [[ $# -gt 0 ]]; do
     --mem) MEM="${2:-}"; shift 2;;
     --batch-size) BATCH_SIZE="${2:-}"; shift 2;;
 
+    --num-buckets) NUM_BUCKETS="${2:-}"; shift 2;;
+    --prepared-dir) PREPARED_DIR="${2:-}"; shift 2;;
+    --clim-buckets) CLIM_BUCKETS_DIR="${2:-}"; shift 2;;
+    --coeffs-dir) COEFFS_DIR="${2:-}"; shift 2;;
+    --patch-dir) PATCH_DIR="${2:-}"; shift 2;;
+    --failures-dir) FAILURES_DIR="${2:-}"; shift 2;;
+    --patch-failures) PATCH_FAILURES_DIR="${2:-}"; shift 2;;
+
     --id-col) ID_COL="${2:-}"; shift 2;;
     --doy-col) DOY_COL="${2:-}"; shift 2;;
     --td-var) TD_VAR="${2:-}"; shift 2;;
     --tmin-var) TMIN_VAR="${2:-}"; shift 2;;
     --outputs-subdir) OUTPUTS_SUBDIR="${2:-}"; shift 2;;
-
     --climatology) CLIMATOLOGY_FILE="${2:-}"; shift 2;;
-    --chunks-dir) CHUNKS_DIR="${2:-}"; shift 2;;
-    --coeffs) COEFFS_FILE="${2:-}"; shift 2;;
-    --patch) PATCH_FILE="${2:-}"; shift 2;;
 
-    --overwrite-chunks) OVERWRITE_CHUNKS=1; shift 1;;
+    --overwrite-prepared) OVERWRITE_PREPARED=1; shift 1;;
+    --overwrite-clim-buckets) OVERWRITE_CLIM_BUCKETS=1; shift 1;;
+    --overwrite-train-output) OVERWRITE_TRAIN_OUTPUT=1; shift 1;;
     --skip-climatology) SKIP_CLIMATOLOGY=1; shift 1;;
+    --skip-prepare) SKIP_PREPARE=1; shift 1;;
     --skip-train) SKIP_TRAIN=1; shift 1;;
     --skip-patch) SKIP_PATCH=1; shift 1;;
 
@@ -154,9 +148,12 @@ if [[ -z "${BASE}" || -z "${RESULTS}" || -z "${GRID}" ]]; then
 fi
 
 CLIM="${RESULTS%/}/${CLIMATOLOGY_FILE}"
-CHUNKS="${RESULTS%/}/${CHUNKS_DIR}"
-COEFFS="${RESULTS%/}/${COEFFS_FILE}"
-PATCH="${RESULTS%/}/${PATCH_FILE}"
+PREPARED="${RESULTS%/}/${PREPARED_DIR}"
+CLIM_BUCKETS="${RESULTS%/}/${CLIM_BUCKETS_DIR}"
+COEFFS="${RESULTS%/}/${COEFFS_DIR}"
+PATCH="${RESULTS%/}/${PATCH_DIR}"
+FAILURES="${RESULTS%/}/${FAILURES_DIR}"
+PATCH_FAILURES="${RESULTS%/}/${PATCH_FAILURES_DIR}"
 
 echo "=== tdew_estimation pipeline ==="
 echo "BASE:    ${BASE}"
@@ -164,28 +161,35 @@ echo "RESULTS: ${RESULTS}"
 echo "GRID:    ${GRID}"
 echo
 echo "Outputs:"
-echo "  CLIM:   ${CLIM}"
-echo "  CHUNKS: ${CHUNKS}"
-echo "  COEFFS: ${COEFFS}"
-echo "  PATCH:  ${PATCH}"
+echo "  CLIM:           ${CLIM}"
+echo "  PREPARED:       ${PREPARED}"
+echo "  CLIM_BUCKETS:   ${CLIM_BUCKETS}"
+echo "  COEFFS:         ${COEFFS}"
+echo "  PATCH:          ${PATCH}"
+echo "  FAILURES:       ${FAILURES}"
+echo "  PATCH_FAILURES: ${PATCH_FAILURES}"
 echo
 echo "Training:"
 echo "  years: ${TRAIN_START}-${TRAIN_END}"
 echo "  h: ${H}"
 echo "  kernel: ${KERNEL}"
 echo "  min_samples: ${MIN_SAMPLES}"
+echo "  num_buckets: ${NUM_BUCKETS}"
 echo
 echo "Dask(local):"
 echo "  workers: ${N_WORKERS}"
 echo "  threads/worker: ${THREADS}"
 echo "  memory_limit: ${MEM}"
-echo "  batch_size: ${BATCH_SIZE}"
+echo "  submit_batch_size: ${BATCH_SIZE}"
 echo
 echo "Flags:"
-echo "  overwrite_chunks: ${OVERWRITE_CHUNKS}"
-echo "  skip_climatology: ${SKIP_CLIMATOLOGY}"
-echo "  skip_train:       ${SKIP_TRAIN}"
-echo "  skip_patch:       ${SKIP_PATCH}"
+echo "  overwrite_prepared:     ${OVERWRITE_PREPARED}"
+echo "  overwrite_clim_buckets: ${OVERWRITE_CLIM_BUCKETS}"
+echo "  overwrite_train_output: ${OVERWRITE_TRAIN_OUTPUT}"
+echo "  skip_climatology:       ${SKIP_CLIMATOLOGY}"
+echo "  skip_prepare:           ${SKIP_PREPARE}"
+echo "  skip_train:             ${SKIP_TRAIN}"
+echo "  skip_patch:             ${SKIP_PATCH}"
 echo
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
@@ -195,14 +199,13 @@ fi
 
 mkdir -p "${RESULTS}"
 
-# 1) Climatology
 if [[ "${SKIP_CLIMATOLOGY}" == "1" ]]; then
-  echo "[1/5] Skipping climatology (per flag)."
+  echo "[1/6] Skipping climatology (per flag)."
 else
   if [[ -f "${CLIM}" ]]; then
-    echo "[1/5] Climatology already exists: ${CLIM}"
+    echo "[1/6] Climatology already exists: ${CLIM}"
   else
-    echo "[1/5] Computing climatology -> ${CLIM}"
+    echo "[1/6] Computing climatology -> ${CLIM}"
     python -c '
 from pathlib import Path
 from tdew_estimation.climatology import calculate_and_save_climatology_chunked
@@ -222,18 +225,47 @@ print("OK: wrote climatology:", "'"${CLIM}"'")
   fi
 fi
 
-# 2) Train anomaly coefficients (Dask)
-if [[ "${SKIP_TRAIN}" == "1" ]]; then
-  echo "[2/5] Skipping training (per flag)."
+if [[ "${SKIP_PREPARE}" == "1" ]]; then
+  echo "[2/6] Skipping bucketed input preparation (per flag)."
 else
-  echo "[2/5] Training anomaly coefficients with Dask -> ${COEFFS}"
+  echo "[2/6] Building bucketed training inputs and climatology shards..."
   python -c '
 from pathlib import Path
-from tdew_estimation.grid import load_grid_ids
-from tdew_estimation.anomaly_train import AnomalyTrainingConfig
-from tdew_estimation.anomaly_dask import run_anomaly_training_dask, DaskAnomalyConfig
+from tdew_estimation.bucketed_data import (
+    build_bucketed_training_dataset,
+    shard_climatology_by_bucket,
+)
 
-ids = load_grid_ids(Path("'"${GRID}"'"), id_column="'"${ID_COL}"'")
+build_result = build_bucketed_training_dataset(
+    year_range=('"${TRAIN_START}"', '"${TRAIN_END}"'),
+    base_path=Path("'"${BASE}"'"),
+    output_dir=Path("'"${PREPARED}"'"),
+    td_var="'"${TD_VAR}"'",
+    tmin_var="'"${TMIN_VAR}"'",
+    outputs_subdir="'"${OUTPUTS_SUBDIR}"'",
+    num_buckets=int("'"${NUM_BUCKETS}"'"),
+    overwrite=bool(int("'"${OVERWRITE_PREPARED}"'")),
+)
+print("Prepared bucketed training data:", build_result)
+
+clim_result = shard_climatology_by_bucket(
+    climatology_path=Path("'"${CLIM}"'"),
+    output_dir=Path("'"${CLIM_BUCKETS}"'"),
+    num_buckets=int("'"${NUM_BUCKETS}"'"),
+    overwrite=bool(int("'"${OVERWRITE_CLIM_BUCKETS}"'")),
+)
+print("Prepared climatology bucket shards:", clim_result)
+'
+fi
+
+if [[ "${SKIP_TRAIN}" == "1" ]]; then
+  echo "[3/6] Skipping bucketed anomaly training (per flag)."
+else
+  echo "[3/6] Training anomaly coefficients by bucket -> ${COEFFS}"
+  python -c '
+from pathlib import Path
+from tdew_estimation.anomaly_train import AnomalyTrainingConfig
+from tdew_estimation.anomaly_dask import DaskAnomalyConfig, run_bucketed_anomaly_training_dask
 
 cfg = AnomalyTrainingConfig(
     base_path=Path("'"${BASE}"'"),
@@ -252,21 +284,22 @@ dc = DaskAnomalyConfig(
     batch_size=int("'"${BATCH_SIZE}"'"),
 )
 
-run_anomaly_training_dask(
-    ids=ids,
+summaries = run_bucketed_anomaly_training_dask(
+    prepared_training_root=Path("'"${PREPARED}"'"),
+    bucketed_climatology_root=Path("'"${CLIM_BUCKETS}"'"),
+    coeffs_output_root=Path("'"${COEFFS}"'"),
+    failure_output_root=Path("'"${FAILURES}"'"),
     config=cfg,
-    climatology_path=Path("'"${CLIM}"'"),
-    chunk_dir=Path("'"${CHUNKS}"'"),
-    combine_output_path=Path("'"${COEFFS}"'"),
     dask_config=dc,
-    overwrite_chunks=bool(int("'"${OVERWRITE_CHUNKS}"'")),
+    overwrite=bool(int("'"${OVERWRITE_TRAIN_OUTPUT}"'")),
 )
-print("OK: wrote coefficients:", "'"${COEFFS}"'")
+print("Bucket training summaries:", len(summaries))
+print("Buckets with rows:", sum(1 for s in summaries if s.coeff_rows > 0))
+print("Failure rows:", sum(s.failure_rows for s in summaries))
 '
 fi
 
-# 3) Check failures
-echo "[3/5] Checking for incomplete DOYs in coefficients..."
+echo "[4/6] Checking for incomplete DOYs in coefficients..."
 DOYS_TO_FIX="$(
 python -c '
 from pathlib import Path
@@ -293,19 +326,16 @@ if [[ -z "${DOYS_TO_FIX}" ]]; then
 fi
 echo "❌ DOYs to fix: ${DOYS_TO_FIX}"
 
-# 4) Retrain failures -> patch parquet
 if [[ "${SKIP_PATCH}" == "1" ]]; then
-  echo "[4/5] Skipping rerun/patch creation (per flag)."
+  echo "[5/6] Skipping rerun/patch creation (per flag)."
 else
-  echo "[4/5] Retraining failed DOYs with Dask -> patch: ${PATCH}"
+  echo "[5/6] Retraining failed DOYs by bucket -> ${PATCH}"
   python -c '
 from pathlib import Path
-from tdew_estimation.grid import load_grid_ids
 from tdew_estimation.anomaly_train import AnomalyTrainingConfig
-from tdew_estimation.anomaly_dask import rerun_failed_doys_with_dask, DaskAnomalyConfig
+from tdew_estimation.anomaly_dask import DaskAnomalyConfig, rerun_failed_doys_with_bucketed_dask
 
 doys = [int(x) for x in "'"${DOYS_TO_FIX}"'".split(",") if x.strip()]
-ids = load_grid_ids(Path("'"${GRID}"'"), id_column="'"${ID_COL}"'")
 
 cfg = AnomalyTrainingConfig(
     base_path=Path("'"${BASE}"'"),
@@ -324,26 +354,28 @@ dc = DaskAnomalyConfig(
     batch_size=int("'"${BATCH_SIZE}"'"),
 )
 
-rerun_failed_doys_with_dask(
-    ids=ids,
+summaries = rerun_failed_doys_with_bucketed_dask(
+    prepared_training_root=Path("'"${PREPARED}"'"),
+    bucketed_climatology_root=Path("'"${CLIM_BUCKETS}"'"),
+    patch_output_root=Path("'"${PATCH}"'"),
+    failure_output_root=Path("'"${PATCH_FAILURES}"'"),
     failed_doys=doys,
     config=cfg,
-    climatology_path=Path("'"${CLIM}"'"),
-    patch_output_path=Path("'"${PATCH}"'"),
     dask_config=dc,
 )
-print("OK: wrote patch:", "'"${PATCH}"'")
+print("Patch bucket summaries:", len(summaries))
+print("Patch buckets with rows:", sum(1 for s in summaries if s.coeff_rows > 0))
+print("Patch failure rows:", sum(s.failure_rows for s in summaries))
 '
 fi
 
-# 5) Patch + re-check
 if [[ "${SKIP_PATCH}" == "1" ]]; then
-  echo "[5/5] Skipping patching/re-check (per flag)."
+  echo "[6/6] Skipping patch/re-check (per flag)."
   echo "Pipeline complete (without patching)."
   exit 0
 fi
 
-echo "[5/5] Patching coefficients inplace and re-checking..."
+echo "[6/6] Patching coefficient dataset in place and re-checking..."
 python -c '
 from pathlib import Path
 from tdew_estimation.grid import expected_count_from_grid

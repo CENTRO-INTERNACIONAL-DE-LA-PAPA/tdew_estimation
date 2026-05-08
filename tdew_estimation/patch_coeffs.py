@@ -49,9 +49,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Iterable, List, Optional, Sequence, Union
 
 import pandas as pd
+
+from .bucket_layout import bucket_dir, discover_bucket_ids
 
 PathLike = Union[str, Path]
 
@@ -71,6 +73,17 @@ class PatchSummary:
     patch_rows_loaded: int
     patch_rows_used: int
     output_rows: int
+
+
+@dataclass(frozen=True)
+class DatasetPatchSummary:
+    """Summary of patching a bucketed coefficient dataset in place."""
+
+    base_coeffs_path: Path
+    patch_coeffs_path: Path
+    output_path: Path
+    doys_to_patch: List[int]
+    bucket_summaries: List[PatchSummary]
 
 
 def _as_path(p: PathLike) -> Path:
@@ -98,6 +111,50 @@ def _validate_key_columns(
         raise KeyError(
             f"{name} is missing required key columns: {missing}. Columns: {list(df.columns)}"
         )
+
+
+def _patch_frames(
+    *,
+    base_df: pd.DataFrame,
+    patch_df: pd.DataFrame,
+    doys: Sequence[int],
+    id_col: str,
+    doy_col: str,
+    keep: str,
+) -> tuple[pd.DataFrame, int, int, int, int, int]:
+    _validate_key_columns(base_df, id_col, doy_col, "base_coeffs")
+    _validate_key_columns(patch_df, id_col, doy_col, "patch_coeffs")
+
+    base_df = base_df.copy()
+    patch_df = patch_df.copy()
+    base_df[doy_col] = pd.to_numeric(base_df[doy_col], errors="coerce").astype("Int64")
+    patch_df[doy_col] = pd.to_numeric(patch_df[doy_col], errors="coerce").astype(
+        "Int64"
+    )
+
+    base_rows_before = int(len(base_df))
+    base_keep_df = base_df[~base_df[doy_col].isin(doys)].copy()
+    base_rows_removed = base_rows_before - int(len(base_keep_df))
+
+    patch_rows_loaded = int(len(patch_df))
+    patch_use_df = patch_df[patch_df[doy_col].isin(doys)].copy()
+    patch_rows_used = int(len(patch_use_df))
+
+    combined = pd.concat([base_keep_df, patch_use_df], ignore_index=True, sort=False)
+    combined = combined.drop_duplicates(subset=[id_col, doy_col], keep=keep)
+    try:
+        combined[doy_col] = combined[doy_col].astype(int)
+    except Exception:
+        pass
+    combined = combined.sort_values([id_col, doy_col]).reset_index(drop=True)
+    return (
+        combined,
+        base_rows_before,
+        base_rows_removed,
+        patch_rows_loaded,
+        patch_rows_used,
+        int(len(combined)),
+    )
 
 
 def patch_anomaly_coeffs(
@@ -216,7 +273,7 @@ def patch_anomaly_coeffs_inplace(
     id_col: str = "ID",
     doy_col: str = "doy",
     parquet_engine: Optional[str] = None,
-) -> PatchSummary:
+) -> Union[PatchSummary, DatasetPatchSummary]:
     """
     In-place patch convenience wrapper.
 
@@ -228,6 +285,66 @@ def patch_anomaly_coeffs_inplace(
     patch_p = _as_path(patch_coeffs_path)
     doys = _normalize_doys(doys_to_patch)
 
+    if base_p.is_dir() or patch_p.is_dir():
+        base_bucket_ids = set(discover_bucket_ids(base_p)) if base_p.is_dir() else set()
+        patch_bucket_ids = set(discover_bucket_ids(patch_p)) if patch_p.is_dir() else set()
+        bucket_ids = sorted(base_bucket_ids | patch_bucket_ids)
+        summaries: List[PatchSummary] = []
+        for bucket_id in bucket_ids:
+            base_file = bucket_dir(base_p, bucket_id) / "coeffs.parquet"
+            patch_file = bucket_dir(patch_p, bucket_id) / "coeffs.parquet"
+            if not patch_file.exists():
+                continue
+
+            if base_file.exists():
+                base_df = pd.read_parquet(base_file)
+            else:
+                patch_probe = pd.read_parquet(patch_file)
+                base_df = pd.DataFrame(columns=patch_probe.columns)
+            patch_df = pd.read_parquet(patch_file)
+
+            (
+                combined,
+                base_rows_before,
+                base_rows_removed,
+                patch_rows_loaded,
+                patch_rows_used,
+                output_rows,
+            ) = _patch_frames(
+                base_df=base_df,
+                patch_df=patch_df,
+                doys=doys,
+                id_col=id_col,
+                doy_col=doy_col,
+                keep="last",
+            )
+
+            base_file.parent.mkdir(parents=True, exist_ok=True)
+            combined.to_parquet(base_file, index=False)
+            summaries.append(
+                PatchSummary(
+                    base_coeffs_path=base_file,
+                    patch_coeffs_path=patch_file,
+                    output_path=base_file,
+                    id_col=id_col,
+                    doy_col=doy_col,
+                    doys_to_patch=doys,
+                    base_rows_before=base_rows_before,
+                    base_rows_removed=base_rows_removed,
+                    patch_rows_loaded=patch_rows_loaded,
+                    patch_rows_used=patch_rows_used,
+                    output_rows=output_rows,
+                )
+            )
+
+        return DatasetPatchSummary(
+            base_coeffs_path=base_p,
+            patch_coeffs_path=patch_p,
+            output_path=base_p,
+            doys_to_patch=doys,
+            bucket_summaries=summaries,
+        )
+
     read_kwargs = {}
     write_kwargs = {}
     if parquet_engine:
@@ -237,29 +354,21 @@ def patch_anomaly_coeffs_inplace(
     base_df = pd.read_parquet(base_p, **read_kwargs)
     patch_df = pd.read_parquet(patch_p, **read_kwargs)
 
-    _validate_key_columns(base_df, id_col, doy_col, "base_coeffs")
-    _validate_key_columns(patch_df, id_col, doy_col, "patch_coeffs")
-
-    base_df[doy_col] = pd.to_numeric(base_df[doy_col], errors="coerce").astype("Int64")
-    patch_df[doy_col] = pd.to_numeric(patch_df[doy_col], errors="coerce").astype(
-        "Int64"
+    (
+        combined,
+        base_rows_before,
+        base_rows_removed,
+        patch_rows_loaded,
+        patch_rows_used,
+        output_rows,
+    ) = _patch_frames(
+        base_df=base_df,
+        patch_df=patch_df,
+        doys=doys,
+        id_col=id_col,
+        doy_col=doy_col,
+        keep="last",
     )
-
-    base_rows_before = int(len(base_df))
-    base_keep_df = base_df[~base_df[doy_col].isin(doys)].copy()
-    base_rows_removed = base_rows_before - int(len(base_keep_df))
-
-    patch_rows_loaded = int(len(patch_df))
-    patch_use_df = patch_df[patch_df[doy_col].isin(doys)].copy()
-    patch_rows_used = int(len(patch_use_df))
-
-    combined = pd.concat([base_keep_df, patch_use_df], ignore_index=True, sort=False)
-    combined = combined.drop_duplicates(subset=[id_col, doy_col], keep="last")
-    try:
-        combined[doy_col] = combined[doy_col].astype(int)
-    except Exception:
-        pass
-    combined = combined.sort_values([id_col, doy_col]).reset_index(drop=True)
 
     base_p.parent.mkdir(parents=True, exist_ok=True)
     combined.to_parquet(base_p, index=False, **write_kwargs)
@@ -275,5 +384,5 @@ def patch_anomaly_coeffs_inplace(
         base_rows_removed=base_rows_removed,
         patch_rows_loaded=patch_rows_loaded,
         patch_rows_used=patch_rows_used,
-        output_rows=int(len(combined)),
+        output_rows=output_rows,
     )

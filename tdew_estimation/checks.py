@@ -55,6 +55,8 @@ from typing import Dict, List, Optional, Tuple, Union, cast
 import pandas as pd
 from pandas import DataFrame, Series
 
+from .parquet_io import read_parquet_any
+
 PathLike = Union[str, Path]
 
 
@@ -147,12 +149,7 @@ def detect_incomplete_anomaly_doys(
     if not p.exists():
         raise FileNotFoundError(f"Coefficient file not found: {p}")
 
-    # Read only needed columns for speed
-    read_kwargs = {}
-    if parquet_engine:
-        read_kwargs["engine"] = parquet_engine
-
-    df = pd.read_parquet(p, columns=[id_col, doy_col], **read_kwargs)
+    df = read_parquet_any(p, columns=[id_col, doy_col], engine=parquet_engine)
 
     if id_col not in df.columns or doy_col not in df.columns:
         raise KeyError(

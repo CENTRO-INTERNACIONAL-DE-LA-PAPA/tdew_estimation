@@ -2,6 +2,10 @@
 
 This repository contains the code used to estimate daily dewpoint temperature (`td`) needed to run Simcast workflows when `td` is not directly available.
 
+PRAM pseudocode and Big-O complexity are documented in:
+- `tdew_estimation_pram.qmd` (Quarto source, Typst format)
+- `tdew_estimation_pram.pdf` (rendered PDF)
+
 The core approach implemented here is an **anomaly-based local linear regression model** (“anomaly model”) that:
 - builds a **daily climatology** for each grid cell (`ID`) and day-of-year (`doy`)
 - models deviations from climatology (`TD_anom`) as a function of temperature anomalies and lagged anomalies
@@ -23,8 +27,8 @@ Inspiration / related work:
 You have two ways to run the pipeline:
 
 - **Recommended**: run the one-shot helper script:
-  - `tdew_estimation/scripts/run_pipeline.sh`
-- **Manual**: run each step as a `python -c '...'` block (kept below for transparency and easy modification)
+  - `scripts/run_pipeline.sh`
+- **Manual**: call the Python modules directly if you want to inspect or customize each phase
 
 ### Environment (recommended)
 ```bash
@@ -33,56 +37,67 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -U pip
 
-# install runtime deps (adjust to your environment)
-pip install "dask[distributed]" pandas pyarrow statsmodels tqdm
+# install the project and its runtime deps
+pip install -e .
+
+# or install the main runtime deps manually
+pip install "dask[distributed]" geopandas numpy pandas pyarrow statsmodels tqdm
 ```
 
 ### Option A (recommended): run the helper script
 
 The helper script runs:
 1) compute climatology
-2) Dask training (chunks + combined parquet)
-3) DOY completeness check
-4) Dask rerun failures (patch parquet)
-5) patch + re-check
+2) build a **bucketed merged training dataset** (`TD`, `TMIN`, `doy`) on disk
+3) shard climatology by the same ID buckets
+4) train anomaly coefficients **by bucket** with Dask
+5) DOY completeness check
+6) rerun only failed DOYs into a patch dataset
+7) patch + re-check
 
 ```bash
-bash tdew_estimation/scripts/run_pipeline.sh \
+bash scripts/run_pipeline.sh \
   --base "/path/to/base" \
   --results "/path/to/results" \
   --grid "/path/to/grid.dbf" \
   --n-workers 8 \
   --threads 4 \
   --mem 16GB \
-  --batch-size 1000
+  --batch-size 64 \
+  --num-buckets 1024
 ```
 
 Outputs written under `--results`:
 - `daily_climatology.parquet`
-- `anomaly_coeffs_chunks/` (batch chunk parquets)
-- `llr_coeffs_anomaly_final_direct.parquet` (combined coefficients)
-- `llr_coeffs_anomaly_patch_doys.parquet` (only if failures exist)
+- `bucketed_training_data/`
+- `climatology_by_bucket/`
+- `llr_coeffs_anomaly_dataset/`
+- `anomaly_failures/`
+- `llr_coeffs_anomaly_patch_dataset/` (only if failures exist)
+- `anomaly_patch_failures/` (only if failures exist)
 
 Useful flags:
 ```bash
 # print resolved settings, don’t run heavy steps
-DRY_RUN=1 bash tdew_estimation/scripts/run_pipeline.sh --base "$BASE" --results "$RESULTS" --grid "$GRID"
+DRY_RUN=1 bash scripts/run_pipeline.sh --base "$BASE" --results "$RESULTS" --grid "$GRID"
 
-# if you want to re-run only the Dask training step
-bash tdew_estimation/scripts/run_pipeline.sh --base "$BASE" --results "$RESULTS" --grid "$GRID" --skip-climatology --skip-patch
+# if you already prepared the bucketed inputs and only want model fitting
+bash scripts/run_pipeline.sh --base "$BASE" --results "$RESULTS" --grid "$GRID" --skip-climatology --skip-prepare --skip-patch
 
-# overwrite existing chunk files (careful)
-bash tdew_estimation/scripts/run_pipeline.sh --base "$BASE" --results "$RESULTS" --grid "$GRID" --overwrite-chunks
+# rebuild bucketed training shards and overwrite coefficient outputs
+bash scripts/run_pipeline.sh --base "$BASE" --results "$RESULTS" --grid "$GRID" --overwrite-prepared --overwrite-clim-buckets --overwrite-train-output
 ```
 
 ### Option B (manual): run each step
 
 These examples show the full workflow:
 1) compute climatology
-2) train anomaly coefficients at scale (Dask) into chunk files and combine
-3) check which DOYs are incomplete
-4) rerun only those DOYs (Dask) to create a patch parquet
-5) patch the combined coefficients and re-check
+2) build a bucketed TD/TMIN training dataset
+3) shard climatology by the same buckets
+4) train coefficients by bucket with Dask
+5) check which DOYs are incomplete
+6) rerun only those DOYs (Dask) into a patch dataset
+7) patch the coefficient dataset and re-check
 
 There is no installed console script; you run Python modules/scripts directly.
 
@@ -93,10 +108,12 @@ RESULTS="/path/to/results"           # where you will write outputs
 GRID="/path/to/grid.dbf"             # grid file defining IDs (dbf/shp/gpkg/geojson/csv/parquet)
 
 CLIM="${RESULTS}/daily_climatology.parquet"
-CHUNKS="${RESULTS}/anomaly_coeffs_chunks"
-COEFFS="${RESULTS}/llr_coeffs_anomaly_final_direct.parquet"
-
-PATCH="${RESULTS}/llr_coeffs_anomaly_patch_doys.parquet"
+PREPARED="${RESULTS}/bucketed_training_data"
+CLIM_BUCKETS="${RESULTS}/climatology_by_bucket"
+COEFFS="${RESULTS}/llr_coeffs_anomaly_dataset"
+FAILURES="${RESULTS}/anomaly_failures"
+PATCH="${RESULTS}/llr_coeffs_anomaly_patch_dataset"
+PATCH_FAILURES="${RESULTS}/anomaly_patch_failures"
 ```
 
 #### 1) Compute daily climatology (TD_clim and TMIN_clim)
@@ -124,17 +141,51 @@ print("Wrote:", "'"${CLIM}"'")
 Expected output:
 - `daily_climatology.parquet` with columns: `ID`, `doy`, `TD_clim`, `TMIN_clim`
 
-#### 2) Train anomaly coefficients at scale (Dask) and combine chunks
-This runs per-ID training tasks with Dask, writes chunk parquets, and optionally combines them into a final coefficient parquet.
+#### 2) Build bucketed training shards and bucketed climatology
+This step pays the expensive TD/TMIN merge once, writes merged monthly shards partitioned by `id_bucket`, and writes matching climatology shards.
 
 ```bash
 python -c '
 from pathlib import Path
-from tdew_estimation.grid import load_grid_ids
-from tdew_estimation.anomaly_train import AnomalyTrainingConfig
-from tdew_estimation.anomaly_dask import run_anomaly_training_dask, DaskAnomalyConfig
+from tdew_estimation.bucketed_data import (
+    build_bucketed_training_dataset,
+    shard_climatology_by_bucket,
+)
 
-ids = load_grid_ids(Path("'"${GRID}"'"), id_column="ID")
+build_bucketed_training_dataset(
+    year_range=(1981, 2016),
+    base_path=Path("'"${BASE}"'"),
+    output_dir=Path("'"${PREPARED}"'"),
+    td_var="td",
+    tmin_var="tmin_v1",
+    outputs_subdir="Outputs",
+    num_buckets=1024,
+    overwrite=False,
+)
+
+shard_climatology_by_bucket(
+    climatology_path=Path("'"${CLIM}"'"),
+    output_dir=Path("'"${CLIM_BUCKETS}"'"),
+    num_buckets=1024,
+    overwrite=False,
+)
+print("Prepared:", "'"${PREPARED}"'")
+print("Climatology shards:", "'"${CLIM_BUCKETS}"'")
+'
+```
+
+Expected outputs:
+- yearly merged bucket shards under `bucketed_training_data/id_bucket=*/train_YYYY.parquet`
+- one climatology parquet per bucket under `climatology_by_bucket/id_bucket=*/climatology.parquet`
+
+#### 3) Train anomaly coefficients by bucket with Dask
+This runs one Dask task per bucket, writes one coefficient parquet per bucket, and writes structured failure logs per bucket.
+
+```bash
+python -c '
+from pathlib import Path
+from tdew_estimation.anomaly_train import AnomalyTrainingConfig
+from tdew_estimation.anomaly_dask import DaskAnomalyConfig, run_bucketed_anomaly_training_dask
 
 cfg = AnomalyTrainingConfig(
     base_path=Path("'"${BASE}"'"),
@@ -150,29 +201,28 @@ dc = DaskAnomalyConfig(
     n_workers=8,
     threads_per_worker=4,
     memory_limit="16GB",
-    batch_size=1000,
+    batch_size=64,
 )
 
-run_anomaly_training_dask(
-    ids=ids,
+summaries = run_bucketed_anomaly_training_dask(
+    prepared_training_root=Path("'"${PREPARED}"'"),
+    bucketed_climatology_root=Path("'"${CLIM_BUCKETS}"'"),
+    coeffs_output_root=Path("'"${COEFFS}"'"),
+    failure_output_root=Path("'"${FAILURES}"'"),
     config=cfg,
-    climatology_path=Path("'"${CLIM}"'"),
-    chunk_dir=Path("'"${CHUNKS}"'"),
-    combine_output_path=Path("'"${COEFFS}"'"),
     dask_config=dc,
-    overwrite_chunks=False,
+    overwrite=False,
 )
-print("Wrote:", "'"${COEFFS}"'")
+print("Buckets processed:", len(summaries))
 '
 ```
 
 Expected outputs:
-- chunk files under `results/anomaly_coeffs_chunks/batch_*.parquet`
-- combined coefficients parquet:
-  - `llr_coeffs_anomaly_final_direct.parquet`
+- coefficient dataset under `llr_coeffs_anomaly_dataset/id_bucket=*/coeffs.parquet`
+- failure logs under `anomaly_failures/id_bucket=*/failures.parquet`
 
-#### 3) Check which DOYs are incomplete (failures)
-This checks, for each DOY, how many distinct IDs exist in the combined coefficient parquet and compares that to the expected ID count from the grid file.
+#### 4) Check which DOYs are incomplete (failures)
+This checks, for each DOY, how many distinct IDs exist in the coefficient dataset and compares that to the expected ID count from the grid file.
 
 ```bash
 python -c '
@@ -196,28 +246,25 @@ print("DOYS_TO_FIX =", report.incomplete_doys)
 
 If `DOYS_TO_FIX` is empty, you’re done.
 
-#### 4) Retrain only the failed DOYs with Dask (create a patch parquet)
-This reruns training restricted to `DOYS_TO_FIX` for all IDs and writes a patch parquet containing only those DOY rows.
+#### 5) Retrain only the failed DOYs with Dask (create a patch dataset)
+This reruns training restricted to `DOYS_TO_FIX` for all buckets and writes a patch coefficient dataset.
 
 ```bash
 python -c '
 from pathlib import Path
-from tdew_estimation.grid import load_grid_ids, expected_count_from_grid
+from tdew_estimation.grid import expected_count_from_grid
 from tdew_estimation.checks import detect_incomplete_anomaly_doys
 from tdew_estimation.anomaly_train import AnomalyTrainingConfig
-from tdew_estimation.anomaly_dask import rerun_failed_doys_with_dask, DaskAnomalyConfig
+from tdew_estimation.anomaly_dask import rerun_failed_doys_with_bucketed_dask, DaskAnomalyConfig
 
 grid = Path("'"${GRID}"'")
 coeffs = Path("'"${COEFFS}"'")
-clim = Path("'"${CLIM}"'")
 patch = Path("'"${PATCH}"'")
 
 expected = expected_count_from_grid(grid, id_column="ID")
 report = detect_incomplete_anomaly_doys(coeffs, expected_count=expected, verbose=False)
 doys_to_fix = report.incomplete_doys
 print("DOYS_TO_FIX =", doys_to_fix)
-
-ids = load_grid_ids(grid, id_column="ID")
 
 cfg = AnomalyTrainingConfig(
     base_path=Path("'"${BASE}"'"),
@@ -229,25 +276,26 @@ cfg = AnomalyTrainingConfig(
     min_samples=15,
 )
 
-dc = DaskAnomalyConfig(n_workers=8, threads_per_worker=4, memory_limit="16GB", batch_size=1000)
+dc = DaskAnomalyConfig(n_workers=8, threads_per_worker=4, memory_limit="16GB", batch_size=64)
 
 if doys_to_fix:
-    rerun_failed_doys_with_dask(
-        ids=ids,
+    rerun_failed_doys_with_bucketed_dask(
+        prepared_training_root=Path("'"${PREPARED}"'"),
+        bucketed_climatology_root=Path("'"${CLIM_BUCKETS}"'"),
+        patch_output_root=patch,
+        failure_output_root=Path("'"${PATCH_FAILURES}"'"),
         failed_doys=doys_to_fix,
         config=cfg,
-        climatology_path=clim,
-        patch_output_path=patch,
         dask_config=dc,
     )
-    print("Wrote patch:", patch)
+    print("Wrote patch dataset:", patch)
 else:
     print("No DOYs to fix; skipping patch creation.")
 '
 ```
 
-#### 5) Patch the combined coefficients and re-check completeness
-This replaces the failed DOY rows in the combined coefficients parquet with the rerun results from the patch parquet.
+#### 6) Patch the coefficient dataset and re-check completeness
+This replaces the failed DOY rows in the base coefficient dataset with the rerun results from the patch dataset.
 
 ```bash
 python -c '
@@ -285,7 +333,7 @@ else:
 
 ## Running Dask across multiple computers (design guide; not implemented here)
 
-The current code starts a *local* Dask cluster inside `run_anomaly_training_dask(...)` by calling `Client(n_workers=..., threads_per_worker=..., ...)`.
+The current code starts a *local* Dask cluster inside `run_bucketed_anomaly_training_dask(...)` by calling `Client(n_workers=..., threads_per_worker=..., ...)`.
 
 To run across multiple machines, you keep the **training logic unchanged** and only change **how the Dask `Client` is created**:
 - start a scheduler + workers outside Python (on multiple computers)
@@ -295,7 +343,7 @@ To run across multiple machines, you keep the **training logic unchanged** and o
 
 You will run:
 - 1 machine as the **scheduler** (coordinates tasks)
-- N machines as **workers** (execute `train_anomaly_coeffs_for_one_id` tasks)
+- N machines as **workers** (execute bucket training tasks)
 - 1 machine as the **driver** (your script that submits tasks; can be the scheduler machine, but doesn’t have to be)
 
 ### Network and security prerequisites (typical)
@@ -334,7 +382,7 @@ Before you try multi-host Dask, confirm with your IT/security team:
    - If your org requires it, use Dask’s TLS support and distribute certs/keys securely (do not commit secrets).
 
 5) **Data access**
-   - All workers must be able to read the same training parquet inputs (TD/TMIN) and write outputs (chunk/patch parquet).
+   - All workers must be able to read the same training parquet inputs (TD/TMIN), bucketed training shards, and coefficient / patch datasets.
    - Common patterns:
      - **Shared filesystem** (NFS/SMB/Lustre): simplest; paths must be valid on every machine.
      - **Object storage** (S3/GCS/Azure): requires adapting I/O paths and credentials; not implemented here.
@@ -344,7 +392,7 @@ Before you try multi-host Dask, confirm with your IT/security team:
 
 - **Consistent environment**: all nodes should run the same Python version and package versions (including `dask[distributed]`, `pandas`, parquet engine).
 - **Resource sizing**:
-  - Workers should have enough RAM to load per-ID time series and the climatology broadcast.
+  - Workers should have enough RAM to load one bucket shard of merged TD/TMIN rows and the matching climatology shard.
   - Tune number of workers and threads based on CPU/RAM and parquet I/O throughput.
 - **Logging / observability**:
   - For a cluster, plan where logs go (local logs, central logging, etc.).
@@ -352,10 +400,10 @@ Before you try multi-host Dask, confirm with your IT/security team:
 
 ### What exact code you must add/change (where and what)
 
-#### File: `tdew_estimation/tdew_estimation/anomaly_dask.py`
-In `run_anomaly_training_dask(...)`, change the function signature to accept a remote scheduler address:
+#### File: `tdew_estimation/anomaly_dask.py`
+In `run_bucketed_anomaly_training_dask(...)`, change the function signature to accept a remote scheduler address:
 
-1) Add this parameter to `run_anomaly_training_dask(...)`:
+1) Add this parameter to `run_bucketed_anomaly_training_dask(...)`:
 - `scheduler_address: Optional[str] = None`
 
 2) Replace the current “Start Dask client (local cluster via distributed defaults)” block with a conditional:
@@ -372,10 +420,10 @@ In `run_anomaly_training_dask(...)`, change the function signature to accept a r
 
 That’s the only code change required to support multi-computer execution.
 
-#### File: `tdew_estimation/tdew_estimation/anomaly_dask.py`
-In `rerun_failed_doys_with_dask(...)`, forward the scheduler address:
+#### File: `tdew_estimation/anomaly_dask.py`
+In `rerun_failed_doys_with_bucketed_dask(...)`, forward the scheduler address:
 - Add `scheduler_address: Optional[str] = None` to the signature
-- Pass it through when calling `run_anomaly_training_dask(...)`
+- Pass it through when calling `run_bucketed_anomaly_training_dask(...)`
 
 #### What you must start outside Python (operational, not implemented here)
 - Start scheduler on a reachable host. Typical/default:
@@ -396,7 +444,7 @@ This repository does not ship cluster bootstrap scripts. Conceptually, you would
 3) Run your driver script (the Python `-c` blocks in this README) but connect to the scheduler by passing:
    - `scheduler_address="tcp://SCHEDULER_HOST:8786"` (example)
 
-The `run_anomaly_training_dask(...)` function is designed so that the only refactor is the `Client(...)` creation; the anomaly training logic remains the same.
+The `run_bucketed_anomaly_training_dask(...)` function is designed so that the only refactor is the `Client(...)` creation; the bucketed anomaly training logic remains the same.
 
 ---
 
@@ -466,7 +514,7 @@ Output coefficients (per `ID`, `doy`):
 - plus diagnostics such as `r_squared_anom` (when available)
 
 These coefficients are stored in:
-- `llr_coeffs_anomaly_final_direct.parquet` (combined output)
+- `llr_coeffs_anomaly_dataset/id_bucket=*/coeffs.parquet`
 
 ---
 
@@ -475,28 +523,29 @@ These coefficients are stored in:
 The original implementation was designed to run for *many* IDs and *all* DOYs, which is expensive. The practical approach is:
 
 1. **Precompute climatology once** for the training period.
-2. Run anomaly training in parallel across IDs (and/or in batches of IDs).
-3. Write intermediate chunks to disk and then combine.
+2. Build a **bucketed merged training dataset** once from monthly TD/TMIN inputs.
+3. Shard climatology by the same ID buckets.
+4. Run anomaly training in parallel across buckets.
 
 Typical pattern:
 - Use a Dask scheduler (`dask.distributed.Client`)
-- Scatter heavy shared data (e.g., climatology table) to workers once (broadcast)
-- Submit per-ID (or per-batch) tasks
-- Collect results and write chunk parquet files to `results/anomaly_coeffs_chunks/`
-- Combine chunk files into the final coefficient parquet
+- Submit one task per bucket
+- Each task reads one bucket shard, fits all IDs in that bucket, and writes `coeffs.parquet`
+- Store structured worker failures alongside the coefficient dataset
 
 Why Dask helps:
-- parallelizes across spatial IDs
+- parallelizes across spatial buckets
 - isolates failures (a single ID failure should not kill the full run)
-- supports batching to control memory pressure
+- supports batching to control scheduler pressure
 
 Key knobs you typically tune:
 - number of workers / threads per worker
-- ID batch size (to manage memory and reduce scheduler overhead)
+- number of ID buckets
+- bucket submit batch size (to manage scheduler overhead)
 - neighborhood half-width `h`
 - minimum samples per DOY regression
 
-> This repository uses **Dask-only orchestration** for multi-ID training runs. The core per-ID fitting function remains in `tdew_estimation.anomaly_train`, while orchestration (batching, chunk writes, combining, and DOY reruns) lives in `tdew_estimation.anomaly_dask`.
+> This repository uses **Dask-only orchestration** for bucket-based training runs. The core regression math remains in `tdew_estimation.anomaly_train`, while bucket preparation and orchestration live in `tdew_estimation.bucketed_data` and `tdew_estimation.anomaly_dask`.
 
 ---
 
@@ -508,46 +557,58 @@ Within your `results_dir` you typically have:
 - `daily_climatology.parquet`
   - columns: `ID`, `doy`, `TD_clim`, `TMIN_clim`
 
-### 2) Anomaly coefficients (combined)
-- `llr_coeffs_anomaly_final_direct.parquet`
+### 2) Anomaly coefficients
+- `llr_coeffs_anomaly_dataset/`
+  - one parquet file per bucket: `id_bucket=*/coeffs.parquet`
   - key columns: `ID`, `doy`
   - coefficient columns: `const_anom`, `TMIN_anom_coeff`, `TD_anom_lag1`, `TD_anom_lag2`, `TMIN_anom_lag1`
   - diagnostics: e.g., `r_squared_anom`
 
-### 3) Intermediate chunks (optional)
-- `anomaly_coeffs_chunks/batch_*.parquet`
-  - per-batch outputs written during distributed execution before combining
+### 3) Prepared training shards
+- `bucketed_training_data/id_bucket=*/train_YYYY.parquet`
+  - merged yearly TD/TMIN training rows partitioned by `id_bucket`
+
+### 4) Climatology shards
+- `climatology_by_bucket/id_bucket=*/climatology.parquet`
+  - one climatology parquet per bucket
+
+### 5) Failure logs
+- `anomaly_failures/id_bucket=*/failures.parquet`
+  - structured bucket / ID / DOY failures recorded during training
 
 ---
 
 ## Code organization (extracted modules)
 
-The extracted, path-agnostic modules live under `tdew_estimation/tdew_estimation/`:
+The extracted, path-agnostic modules live under `tdew_estimation/`:
 
 - `grid.py`
   - loads grid IDs from a grid file (DBF/SHP/GPKG/GeoJSON/CSV/Parquet)
   - computes `EXPECTED_COUNT` (number of unique IDs)
 
 - `checks.py`
-  - detects incomplete DOYs in the combined anomaly coefficient parquet using “Option A”
+  - detects incomplete DOYs in a coefficient parquet file or a bucketed coefficient dataset using “Option A”
   - produces a copy-paste-friendly `DOYS_TO_FIX` list
 
 - `anomaly_train.py`
-  - core anomaly coefficient training logic (per-ID)
-  - supports restricting training to a subset of DOYs (used for repair runs submitted via Dask)
+  - core anomaly coefficient training logic
+  - supports fitting from already prepared TD/TMIN frames and restricting to a subset of DOYs
 
 - `patch_coeffs.py`
-  - patches the combined coefficient parquet by replacing only the DOYs being repaired
+  - patches a single coefficient parquet or a bucketed coefficient dataset by replacing only the DOYs being repaired
 
 - `anomaly_dask.py`
   - Dask-based orchestration for anomaly training at scale
-  - runs per-ID training tasks (`train_anomaly_coeffs_for_one_id`) in batches
-  - writes chunk parquet files and optionally combines them into a final coefficients parquet
-  - includes a helper to rerun only failed/incomplete DOYs and write a patch parquet
+  - runs one task per bucket and writes bucket-local coefficient outputs
+  - records structured failure logs
+  - includes a helper to rerun only failed/incomplete DOYs into a patch dataset
+
+- `bucketed_data.py`
+  - builds the bucketed merged TD/TMIN training dataset
+  - shards climatology by the same bucket layout
 
 - `main.py`
-  - an example usage script wiring: detect → retrain DOYs (Dask) → patch → re-check
-  - not a CLI; uses arguments only as an example of path-agnostic configuration
+  - a lightweight CLI/example entrypoint wiring: detect → retrain DOYs (bucketed Dask) → patch → re-check
 
 ---
 
@@ -561,9 +622,9 @@ If `actual_count != EXPECTED_COUNT`, then that DOY is incomplete and should be r
 
 Repair workflow:
 1. Compute `EXPECTED_COUNT` from the grid file.
-2. Detect `DOYS_TO_FIX` from `llr_coeffs_anomaly_final_direct.parquet`.
-3. Retrain anomaly coefficients **only** for those DOYs (for all IDs) into a “patch” parquet.
-4. Patch the combined coefficient parquet by replacing those DOYs.
+2. Detect `DOYS_TO_FIX` from `llr_coeffs_anomaly_dataset/`.
+3. Retrain anomaly coefficients **only** for those DOYs into a bucketed patch dataset.
+4. Patch the base coefficient dataset by replacing those DOYs.
 5. Re-check completeness.
 
 This keeps the repair step small and avoids re-running the full 366-DOY training.
@@ -572,7 +633,7 @@ This keeps the repair step small and avoids re-running the full 366-DOY training
 
 ## Notes / future improvements (not implemented here yet)
 
-- Better I/O patterns for training (reduce repeated parquet reads per ID)
-- Smarter caching strategies for per-ID time series
-- More efficient partitioning strategies (per DOY or per ID shards)
+- Remote-scheduler support for multi-host Dask runs
+- Direct NumPy weighted least-squares to reduce `statsmodels` overhead
+- Forecast refactor to use the same bucketed data layout as training
 - A dedicated CLI entrypoint (thin layer over the extracted modules)

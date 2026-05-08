@@ -428,7 +428,10 @@ def forecast_with_dask(
 
             results: List[pd.DataFrame] = []
             for fut in as_completed(futures):
-                df = fut.result()
+                try:
+                    df = fut.result()
+                except Exception:
+                    continue
                 if df is not None and not df.empty:
                     results.append(df)
 
@@ -513,4 +516,3 @@ def split_predictions_to_monthly_parquet(
         outputs.append(out_path)
 
     return outputs
-"""

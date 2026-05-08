@@ -36,6 +36,9 @@ env/
 .ipynb_checkpoints/
 .notebook/
 
+# Quarto render cache
+.quarto/
+
 # IDE / editor
 .vscode/
 .idea/

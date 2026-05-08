@@ -1,0 +1,248 @@
+"""
+tdew_estimation.bucketed_data
+
+Preprocessing helpers for bucket-based anomaly training.
+
+The goal is to pay the TD/TMIN merge cost once, write bucketed training shards
+to disk, and then run model fitting by bucket instead of by ID.
+"""
+
+from __future__ import annotations
+
+import logging
+import shutil
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Sequence, Tuple, Union
+
+import pandas as pd
+from pandas import DataFrame
+from tqdm import tqdm
+
+from .bucket_layout import bucket_dir, bucket_for_id, discover_bucket_ids
+from .climatology import find_parquet_files
+from .parquet_io import as_path, read_parquet_any
+
+PathLike = Union[str, Path]
+
+
+@dataclass(frozen=True)
+class BucketedTrainingBuildResult:
+    output_dir: Path
+    year_range: Tuple[int, int]
+    num_buckets: int
+    years_processed: int
+    bucket_files_written: int
+
+
+@dataclass(frozen=True)
+class BucketedClimatologyResult:
+    output_dir: Path
+    num_buckets: int
+    shards_written: int
+
+
+def _month_range_strings(month_start: pd.Timestamp) -> tuple[str, str]:
+    month_end = (month_start + pd.offsets.MonthEnd(1)).normalize()
+    return (month_start.strftime("%Y-%m-%d"), month_end.strftime("%Y-%m-%d"))
+
+
+def _merge_monthly_training_inputs(
+    *,
+    base_path: PathLike,
+    td_var: str,
+    tmin_var: str,
+    outputs_subdir: str,
+    month_start: pd.Timestamp,
+) -> Optional[DataFrame]:
+    date_range = _month_range_strings(month_start)
+    td_files = find_parquet_files(
+        base_path,
+        td_var,
+        date_range,
+        outputs_subdir=outputs_subdir,
+        tmin_v1_legacy_name=True,
+    )
+    tmin_files = find_parquet_files(
+        base_path,
+        tmin_var,
+        date_range,
+        outputs_subdir=outputs_subdir,
+        tmin_v1_legacy_name=True,
+    )
+    if not td_files or not tmin_files:
+        return None
+
+    df_td_list = [pd.read_parquet(p) for p in td_files]
+    df_tmin_list = [pd.read_parquet(p) for p in tmin_files]
+    if not df_td_list or not df_tmin_list:
+        return None
+
+    df_td = pd.concat(df_td_list, ignore_index=True).rename(columns={"Value": "TD"})
+    df_tmin = pd.concat(df_tmin_list, ignore_index=True).rename(columns={"Value": "TMIN"})
+    if df_td.empty or df_tmin.empty:
+        return None
+
+    merged = pd.merge(df_td, df_tmin, on=["FECHA", "ID"], how="inner")
+    if merged.empty:
+        return None
+
+    merged["FECHA"] = pd.to_datetime(merged["FECHA"])
+    merged["doy"] = merged["FECHA"].dt.dayofyear.astype("int16")
+    return merged[["ID", "FECHA", "TD", "TMIN", "doy"]].copy()
+
+
+def build_bucketed_training_dataset(
+    *,
+    year_range: Tuple[int, int],
+    base_path: PathLike,
+    output_dir: PathLike,
+    td_var: str = "td",
+    tmin_var: str = "tmin_v1",
+    outputs_subdir: str = "Outputs",
+    num_buckets: int = 1024,
+    overwrite: bool = False,
+    logger: Optional[logging.Logger] = None,
+) -> BucketedTrainingBuildResult:
+    """
+    Build merged training shards under ``output_dir/id_bucket=XXXX/train_YYYY.parquet``.
+    """
+    log = logger or logging.getLogger(__name__)
+    start_year, end_year = year_range
+    if start_year > end_year:
+        raise ValueError(f"Invalid year_range={year_range}: start_year > end_year")
+    if num_buckets <= 0:
+        raise ValueError("num_buckets must be a positive integer.")
+
+    out_dir = as_path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    years_processed = 0
+    bucket_files_written = 0
+
+    for year in tqdm(range(start_year, end_year + 1), desc="Building Bucketed Training Data"):
+        year_marker = out_dir / f".done_{year}"
+        if year_marker.exists() and not overwrite:
+            continue
+
+        temp_year_dir = out_dir / f".tmp_year_{year}"
+        if temp_year_dir.exists():
+            shutil.rmtree(temp_year_dir)
+        temp_year_dir.mkdir(parents=True, exist_ok=True)
+
+        month_starts = pd.date_range(f"{year}-01-01", f"{year}-12-31", freq="MS")
+        for month_start in month_starts:
+            ym = month_start.strftime("%Y_%m")
+            merged = _merge_monthly_training_inputs(
+                base_path=base_path,
+                td_var=td_var,
+                tmin_var=tmin_var,
+                outputs_subdir=outputs_subdir,
+                month_start=month_start,
+            )
+            if merged is None or merged.empty:
+                continue
+
+            merged["ID"] = pd.to_numeric(merged["ID"], errors="coerce").astype("Int64")
+            merged = merged.dropna(subset=["ID"]).copy()
+            merged["ID"] = merged["ID"].astype(int)
+            merged["id_bucket"] = merged["ID"].map(
+                lambda value: bucket_for_id(int(value), num_buckets=num_buckets)
+            )
+
+            for bucket_id, bucket_df in merged.groupby("id_bucket", sort=True):
+                temp_bucket_dir = bucket_dir(temp_year_dir, int(bucket_id))
+                temp_bucket_dir.mkdir(parents=True, exist_ok=True)
+                temp_file = temp_bucket_dir / f"part_{ym}.parquet"
+                to_write = bucket_df.drop(columns=["id_bucket"]).sort_values(
+                    ["ID", "FECHA"]
+                )
+                to_write.to_parquet(temp_file, engine="pyarrow", index=False)
+
+        bucket_ids_in_year = discover_bucket_ids(temp_year_dir)
+        if not bucket_ids_in_year:
+            shutil.rmtree(temp_year_dir)
+            continue
+
+        for bucket_id in bucket_ids_in_year:
+            bucket_out_dir = bucket_dir(out_dir, int(bucket_id))
+            bucket_out_dir.mkdir(parents=True, exist_ok=True)
+            out_file = bucket_out_dir / f"train_{year}.parquet"
+            if out_file.exists() and not overwrite:
+                continue
+
+            yearly_bucket_df = read_parquet_any(bucket_dir(temp_year_dir, int(bucket_id)))
+            if "id_bucket" in yearly_bucket_df.columns:
+                yearly_bucket_df = yearly_bucket_df.drop(columns=["id_bucket"])
+            yearly_bucket_df = yearly_bucket_df.sort_values(["ID", "FECHA"]).reset_index(
+                drop=True
+            )
+            yearly_bucket_df.to_parquet(out_file, engine="pyarrow", index=False)
+            bucket_files_written += 1
+
+        shutil.rmtree(temp_year_dir)
+        year_marker.write_text("ok\n", encoding="ascii")
+        years_processed += 1
+
+    log.info(
+        "Built bucketed training dataset at %s with %s year(s) and %s file(s).",
+        out_dir,
+        years_processed,
+        bucket_files_written,
+    )
+    return BucketedTrainingBuildResult(
+        output_dir=out_dir,
+        year_range=year_range,
+        num_buckets=num_buckets,
+        years_processed=years_processed,
+        bucket_files_written=bucket_files_written,
+    )
+
+
+def shard_climatology_by_bucket(
+    *,
+    climatology_path: PathLike,
+    output_dir: PathLike,
+    num_buckets: int = 1024,
+    overwrite: bool = False,
+) -> BucketedClimatologyResult:
+    """
+    Write one climatology shard per bucket under ``output_dir/id_bucket=XXXX``.
+    """
+    if num_buckets <= 0:
+        raise ValueError("num_buckets must be a positive integer.")
+
+    clim_path = as_path(climatology_path)
+    out_dir = as_path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    climatology_df = pd.read_parquet(clim_path)
+    if climatology_df.empty:
+        raise ValueError(f"Climatology is empty: {clim_path}")
+
+    climatology_df["ID"] = pd.to_numeric(
+        climatology_df["ID"], errors="coerce"
+    ).astype("Int64")
+    climatology_df = climatology_df.dropna(subset=["ID"]).copy()
+    climatology_df["ID"] = climatology_df["ID"].astype(int)
+    climatology_df["id_bucket"] = climatology_df["ID"].map(
+        lambda value: bucket_for_id(int(value), num_buckets=num_buckets)
+    )
+
+    shards_written = 0
+    for bucket_id, bucket_df in climatology_df.groupby("id_bucket", sort=True):
+        bucket_out_dir = bucket_dir(out_dir, int(bucket_id))
+        bucket_out_dir.mkdir(parents=True, exist_ok=True)
+        out_file = bucket_out_dir / "climatology.parquet"
+        if out_file.exists() and not overwrite:
+            continue
+
+        to_write = bucket_df.drop(columns=["id_bucket"]).sort_values(["ID", "doy"])
+        to_write.to_parquet(out_file, engine="pyarrow", index=False)
+        shards_written += 1
+
+    return BucketedClimatologyResult(
+        output_dir=out_dir,
+        num_buckets=num_buckets,
+        shards_written=shards_written,
+    )

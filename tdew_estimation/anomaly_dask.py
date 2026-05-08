@@ -65,16 +65,25 @@ run_anomaly_training_dask(
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, List, Optional, Sequence, Set, Union
 
 import pandas as pd
 
-from .anomaly_train import AnomalyTrainingConfig, train_anomaly_coeffs_for_one_id
+from .anomaly_train import (
+    AnomalyTrainingConfig,
+    fit_anomaly_coeffs_for_prepared_id,
+    train_anomaly_coeffs_for_one_id,
+)
+from .bucket_layout import bucket_dir, discover_bucket_ids
+from .parquet_io import as_path, read_parquet_any
 
 PathLike = Union[str, Path]
+
+
+def _as_path(p: PathLike) -> Path:
+    return as_path(p)
 
 
 @dataclass(frozen=True)
@@ -91,7 +100,8 @@ class DaskAnomalyConfig:
     memory_limit:
         Per-worker memory limit string (e.g., "16GB") or None.
     batch_size:
-        Number of IDs per batch. Each batch produces one chunk file.
+        Submission batch size. In the legacy per-ID path it means IDs per output chunk;
+        in the bucketed path it means bucket tasks submitted at once.
     scheduler_timeout_s:
         Timeout for workers to connect in seconds.
     """
@@ -101,11 +111,6 @@ class DaskAnomalyConfig:
     memory_limit: Optional[str] = "16GB"
     batch_size: int = 1000
     scheduler_timeout_s: int = 120
-
-
-def _as_path(p: PathLike) -> Path:
-    return Path(p).expanduser().resolve()
-
 
 def _normalize_doys(doys: Optional[Sequence[int]]) -> Optional[Set[int]]:
     if doys is None:
@@ -133,6 +138,178 @@ def _combine_chunks(chunk_files: Sequence[Path], out_path: Path) -> Path:
     final_df = pd.concat([pd.read_parquet(p) for p in chunk_files], ignore_index=True)
     final_df.to_parquet(out_path, engine="pyarrow", index=False)
     return out_path
+
+
+@dataclass(frozen=True)
+class BucketTrainingSummary:
+    bucket_id: int
+    id_count: int
+    coeff_rows: int
+    failure_rows: int
+    status: str
+    coeffs_path: Path
+    failures_path: Optional[Path]
+
+
+def _failure_row(
+    *,
+    phase: str,
+    bucket_id: int,
+    message: str,
+    location_id: Optional[int] = None,
+    doy: Optional[int] = None,
+    exception_type: str = "",
+) -> dict[str, Any]:
+    return {
+        "phase": phase,
+        "bucket_id": int(bucket_id),
+        "ID": None if location_id is None else int(location_id),
+        "doy": None if doy is None else int(doy),
+        "exception_type": exception_type,
+        "message": str(message),
+    }
+
+
+def _concat_frames(frames: Sequence[pd.DataFrame]) -> pd.DataFrame:
+    non_empty = [df for df in frames if df is not None and not df.empty]
+    if not non_empty:
+        return pd.DataFrame()
+    return pd.concat(non_empty, ignore_index=True, sort=False)
+
+
+def _train_anomaly_bucket_task(
+    *,
+    bucket_id: int,
+    prepared_training_root: PathLike,
+    bucketed_climatology_root: PathLike,
+    coeffs_output_root: PathLike,
+    config: AnomalyTrainingConfig,
+    doys: Optional[Sequence[int]] = None,
+    failure_output_root: Optional[PathLike] = None,
+    overwrite: bool = False,
+) -> BucketTrainingSummary:
+    """
+    Worker task: fit all IDs in one bucket and write results directly to disk.
+    """
+    bucket_training_dir = bucket_dir(prepared_training_root, bucket_id)
+    bucket_clim_dir = bucket_dir(bucketed_climatology_root, bucket_id)
+    coeffs_dir = bucket_dir(coeffs_output_root, bucket_id)
+    coeffs_dir.mkdir(parents=True, exist_ok=True)
+    coeffs_file = coeffs_dir / "coeffs.parquet"
+
+    failures_file: Optional[Path] = None
+    if failure_output_root is not None:
+        failures_dir = bucket_dir(failure_output_root, bucket_id)
+        failures_dir.mkdir(parents=True, exist_ok=True)
+        failures_file = failures_dir / "failures.parquet"
+
+    if coeffs_file.exists() and not overwrite:
+        return BucketTrainingSummary(
+            bucket_id=int(bucket_id),
+            id_count=0,
+            coeff_rows=0,
+            failure_rows=0,
+            status="skipped",
+            coeffs_path=coeffs_file,
+            failures_path=failures_file if failures_file and failures_file.exists() else None,
+        )
+
+    failures: List[dict[str, Any]] = []
+    coeff_frames: List[pd.DataFrame] = []
+    id_count = 0
+
+    try:
+        train_df = read_parquet_any(bucket_training_dir)
+    except Exception as exc:
+        failures.append(
+            _failure_row(
+                phase="read_training_bucket",
+                bucket_id=bucket_id,
+                exception_type=type(exc).__name__,
+                message=str(exc),
+            )
+        )
+        train_df = pd.DataFrame()
+
+    clim_file = bucket_clim_dir / "climatology.parquet"
+    if clim_file.exists():
+        clim_df = pd.read_parquet(clim_file)
+    else:
+        failures.append(
+            _failure_row(
+                phase="read_climatology_bucket",
+                bucket_id=bucket_id,
+                message=f"Missing climatology shard: {clim_file}",
+            )
+        )
+        clim_df = pd.DataFrame()
+
+    if not train_df.empty and not clim_df.empty:
+        train_df["ID"] = pd.to_numeric(train_df["ID"], errors="coerce").astype("Int64")
+        train_df = train_df.dropna(subset=["ID"]).copy()
+        train_df["ID"] = train_df["ID"].astype(int)
+        clim_df["ID"] = pd.to_numeric(clim_df["ID"], errors="coerce").astype("Int64")
+        clim_df = clim_df.dropna(subset=["ID"]).copy()
+        clim_df["ID"] = clim_df["ID"].astype(int)
+
+        doys_set = _normalize_doys(doys)
+        for location_id, id_df in train_df.groupby("ID", sort=True):
+            id_count += 1
+            try:
+                coeffs_df, id_failures = fit_anomaly_coeffs_for_prepared_id(
+                    int(location_id),
+                    prepared_df=id_df,
+                    climatology_df=clim_df[clim_df["ID"] == int(location_id)].copy(),
+                    config=config,
+                    doys=doys_set,
+                )
+            except Exception as exc:
+                failures.append(
+                    _failure_row(
+                        phase="fit_id",
+                        bucket_id=bucket_id,
+                        location_id=int(location_id),
+                        exception_type=type(exc).__name__,
+                        message=str(exc),
+                    )
+                )
+                continue
+
+            if coeffs_df is not None and not coeffs_df.empty:
+                coeff_frames.append(coeffs_df)
+            if id_failures is not None and not id_failures.empty:
+                id_failures = id_failures.copy()
+                id_failures["bucket_id"] = int(bucket_id)
+                failures.extend(id_failures.to_dict(orient="records"))
+
+    coeffs_df = _concat_frames(coeff_frames)
+    failures_df = pd.DataFrame(failures)
+
+    if not coeffs_df.empty:
+        coeffs_df = coeffs_df.sort_values(["ID", "doy"]).reset_index(drop=True)
+        coeffs_df.to_parquet(coeffs_file, engine="pyarrow", index=False)
+    elif overwrite and coeffs_file.exists():
+        coeffs_file.unlink()
+
+    if failures_file is not None:
+        if not failures_df.empty:
+            failures_df = failures_df.sort_values(
+                ["bucket_id", "ID", "doy"], na_position="last"
+            ).reset_index(drop=True)
+            failures_df.to_parquet(failures_file, engine="pyarrow", index=False)
+        elif overwrite and failures_file.exists():
+            failures_file.unlink()
+
+    status = "ok" if not coeffs_df.empty else "empty"
+    return BucketTrainingSummary(
+        bucket_id=int(bucket_id),
+        id_count=int(id_count),
+        coeff_rows=int(len(coeffs_df)),
+        failure_rows=int(len(failures_df)),
+        status=status,
+        coeffs_path=coeffs_file,
+        failures_path=failures_file if failures_file and failures_file.exists() else None,
+    )
 
 
 def run_anomaly_training_dask(
@@ -261,6 +438,103 @@ def run_anomaly_training_dask(
         client.close()
 
     return chunk_paths
+
+
+def run_bucketed_anomaly_training_dask(
+    *,
+    prepared_training_root: PathLike,
+    bucketed_climatology_root: PathLike,
+    coeffs_output_root: PathLike,
+    config: AnomalyTrainingConfig,
+    bucket_ids: Optional[Sequence[int]] = None,
+    doys: Optional[Sequence[int]] = None,
+    dask_config: Optional[DaskAnomalyConfig] = None,
+    failure_output_root: Optional[PathLike] = None,
+    overwrite: bool = False,
+) -> List[BucketTrainingSummary]:
+    """
+    Run anomaly training by bucket instead of by individual ID.
+
+    Each worker task reads one bucket shard of the prepared training dataset, fits
+    all IDs inside that bucket, and writes its own parquet output directly.
+    """
+    from dask.distributed import Client, as_completed  # imported lazily
+
+    dc = dask_config or DaskAnomalyConfig()
+    prepared_root_p = as_path(prepared_training_root)
+    bucketed_clim_root_p = as_path(bucketed_climatology_root)
+    coeffs_root_p = as_path(coeffs_output_root)
+    coeffs_root_p.mkdir(parents=True, exist_ok=True)
+    failure_root_p = as_path(failure_output_root) if failure_output_root is not None else None
+    if failure_root_p is not None:
+        failure_root_p.mkdir(parents=True, exist_ok=True)
+
+    if bucket_ids is None:
+        buckets_to_run = discover_bucket_ids(prepared_root_p)
+    else:
+        buckets_to_run = sorted({int(b) for b in bucket_ids})
+    if not buckets_to_run:
+        raise ValueError(f"No buckets found under {prepared_root_p}")
+
+    client = Client(
+        n_workers=dc.n_workers,
+        threads_per_worker=dc.threads_per_worker,
+        memory_limit=dc.memory_limit,
+        timeout=f"{dc.scheduler_timeout_s}s",
+    )
+
+    summaries: List[BucketTrainingSummary] = []
+    try:
+        for offset in range(0, len(buckets_to_run), dc.batch_size):
+            bucket_batch = buckets_to_run[offset : offset + dc.batch_size]
+            futures = [
+                client.submit(
+                    _train_anomaly_bucket_task,
+                    bucket_id=int(bucket_id),
+                    prepared_training_root=prepared_root_p,
+                    bucketed_climatology_root=bucketed_clim_root_p,
+                    coeffs_output_root=coeffs_root_p,
+                    config=config,
+                    doys=doys,
+                    failure_output_root=failure_root_p,
+                    overwrite=overwrite,
+                    pure=False,
+                )
+                for bucket_id in bucket_batch
+            ]
+            for fut in as_completed(futures):
+                summaries.append(fut.result())
+    finally:
+        client.close()
+
+    return sorted(summaries, key=lambda item: item.bucket_id)
+
+
+def rerun_failed_doys_with_bucketed_dask(
+    *,
+    prepared_training_root: PathLike,
+    bucketed_climatology_root: PathLike,
+    patch_output_root: PathLike,
+    failed_doys: Sequence[int],
+    config: AnomalyTrainingConfig,
+    dask_config: Optional[DaskAnomalyConfig] = None,
+    failure_output_root: Optional[PathLike] = None,
+    bucket_ids: Optional[Sequence[int]] = None,
+) -> List[BucketTrainingSummary]:
+    """
+    Retrain only selected DOYs using the bucket-based execution path.
+    """
+    return run_bucketed_anomaly_training_dask(
+        prepared_training_root=prepared_training_root,
+        bucketed_climatology_root=bucketed_climatology_root,
+        coeffs_output_root=patch_output_root,
+        config=config,
+        bucket_ids=bucket_ids,
+        doys=failed_doys,
+        dask_config=dask_config,
+        failure_output_root=failure_output_root,
+        overwrite=True,
+    )
 
 
 def rerun_failed_doys_with_dask(

@@ -4,13 +4,13 @@ tdew_estimation.main
 Example "main" showing a PATH-AGNOSTIC workflow to:
 
 1) compute EXPECTED_COUNT from a grid file (e.g., PotatoZonning DBF)
-2) detect incomplete DOYs in the *combined anomaly coefficient* parquet
+2) detect incomplete DOYs in the anomaly coefficient dataset
    (Option A: actual_count != expected_count)
-3) retrain anomaly coefficients ONLY for DOYs_TO_FIX (producing a patch parquet)
-4) patch the combined coefficients parquet by replacing those DOYs
+3) retrain anomaly coefficients ONLY for DOYs_TO_FIX (producing a patch dataset)
+4) patch the coefficient dataset by replacing those DOYs
 5) (optional) re-check completeness after patching
 
-This is an example usage script, not a CLI. It avoids hard-coded paths by using
+This is a lightweight CLI/example entrypoint. It avoids hard-coded paths by using
 arguments and clearly marked placeholders.
 
 Assumed artifacts (from your pipeline)
@@ -19,27 +19,31 @@ Assumed artifacts (from your pipeline)
 - Daily climatology parquet:
     daily_climatology.parquet
   with columns: ID, doy, TD_clim, TMIN_clim
-- Combined anomaly coefficients parquet (the one you check/patch):
-    llr_coeffs_anomaly_final_direct.parquet
+- Bucketed prepared training dataset:
+    bucketed_training_data/
+- Bucketed climatology shards:
+    climatology_by_bucket/
+- Anomaly coefficients dataset (the one you check/patch):
+    llr_coeffs_anomaly_dataset/
   with columns including at least: ID, doy, const_anom, TMIN_anom_coeff, TD_anom_lag1, ...
 
 Notes
 -----
 - This script uses the "anomaly" model only (no GPU per-DOY model files).
-- Retraining by DOY means: fit the same anomaly regression, but restrict doy_target
-  loop to DOYs_TO_FIX for every ID.
-- The retrain step is implemented here using the Dask-only runner in
-  tdew_estimation.anomaly_dask (so this example assumes Dask is available).
+- Retraining by DOY means: fit the same anomaly regression, but restrict the rerun
+  to the requested DOYs while keeping the bucket layout unchanged.
+- The retrain step is implemented here using the bucketed Dask runner in
+  `tdew_estimation.anomaly_dask`.
 
 Example usage
 -------------
-python tdew_estimation/main.py \
+python main.py \
   --base-path "/media/ppalacios/Data1/henry_simcast_peru" \
   --grid-file "/media/ppalacios/Data1/henry_simcast_peru/PotatoZonning/CENAGRO_OnlyPotatoes_Pisco_Altitude.dbf" \
   --results-dir "/media/ppalacios/Data1/henry_simcast_peru/results"
 
 If you already know DOYs_TO_FIX and want to rerun directly:
-python tdew_estimation/main.py \
+python main.py \
   --base-path "/path/to/base" \
   --grid-file "/path/to/grid.dbf" \
   --results-dir "/path/to/results" \
@@ -51,12 +55,15 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
 
-from tdew_estimation.anomaly_dask import rerun_failed_doys_with_dask
+from tdew_estimation.anomaly_dask import (
+    DaskAnomalyConfig,
+    rerun_failed_doys_with_bucketed_dask,
+)
 from tdew_estimation.anomaly_train import AnomalyTrainingConfig
 from tdew_estimation.checks import detect_incomplete_anomaly_doys
-from tdew_estimation.grid import expected_count_from_grid, load_grid_ids
+from tdew_estimation.grid import expected_count_from_grid
 from tdew_estimation.patch_coeffs import patch_anomaly_coeffs_inplace
 
 
@@ -93,18 +100,23 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--results-dir",
         required=True,
-        help="Directory for results artifacts (coeffs/climatology/chunks).",
+        help="Directory for results artifacts (climatology, bucketed inputs, coefficients, patches).",
     )
 
-    p.add_argument(
-        "--coeffs-file",
-        default="llr_coeffs_anomaly_final_direct.parquet",
-        help="Combined anomaly coefficients parquet filename within results-dir.",
-    )
     p.add_argument(
         "--climatology-file",
         default="daily_climatology.parquet",
         help="Daily climatology parquet filename within results-dir.",
+    )
+    p.add_argument(
+        "--prepared-training-dir",
+        default="bucketed_training_data",
+        help="Directory containing bucketed prepared TD/TMIN training shards.",
+    )
+    p.add_argument(
+        "--bucketed-climatology-dir",
+        default="climatology_by_bucket",
+        help="Directory containing climatology shards bucketed by ID.",
     )
 
     p.add_argument(
@@ -146,9 +158,18 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
     p.add_argument(
         "--patch-file",
-        default="llr_coeffs_anomaly_patch_doys.parquet",
-        help="Filename for the patch parquet to write within results-dir.",
+        default="llr_coeffs_anomaly_patch_dataset",
+        help="Directory for patch coefficient shards within results-dir.",
     )
+    p.add_argument(
+        "--coeffs-file",
+        default="llr_coeffs_anomaly_dataset",
+        help="Directory for coefficient shards within results-dir.",
+    )
+    p.add_argument("--n-workers", type=int, default=8)
+    p.add_argument("--threads-per-worker", type=int, default=4)
+    p.add_argument("--memory-limit", default="16GB")
+    p.add_argument("--submit-batch-size", type=int, default=64)
 
     return p.parse_args(argv)
 
@@ -162,6 +183,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     coeffs_path = results_dir / args.coeffs_file
     climatology_path = results_dir / args.climatology_file
+    prepared_training_dir = results_dir / args.prepared_training_dir
+    bucketed_climatology_dir = results_dir / args.bucketed_climatology_dir
     patch_path = results_dir / args.patch_file
 
     if not base_path.exists():
@@ -178,6 +201,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
     if not climatology_path.exists():
         print(f"ERROR: climatology file not found: {climatology_path}", file=sys.stderr)
+        return 2
+    if not prepared_training_dir.exists():
+        print(
+            f"ERROR: prepared training dir not found: {prepared_training_dir}",
+            file=sys.stderr,
+        )
+        return 2
+    if not bucketed_climatology_dir.exists():
+        print(
+            f"ERROR: bucketed climatology dir not found: {bucketed_climatology_dir}",
+            file=sys.stderr,
+        )
         return 2
 
     # 1) expected_count from grid
@@ -205,11 +240,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     print("\nDOYs to retrain:", doys_to_fix)
 
-    # 3) Load all IDs (you can later optimize this by reading only needed IDs)
-    ids = load_grid_ids(grid_file, id_column=args.id_column)
-    print(f"Loaded {len(ids)} IDs from grid.")
-
-    # 4) Retrain ONLY those DOYs -> patch parquet
+    # 3) Retrain ONLY those DOYs -> patch dataset
     cfg = AnomalyTrainingConfig(
         base_path=base_path,
         td_var="td",
@@ -219,19 +250,26 @@ def main(argv: Optional[list[str]] = None) -> int:
         kernel=args.kernel,
         min_samples=args.min_samples,
     )
-
-    print("\nRetraining anomaly coefficients for failed DOYs only (Dask)...")
-    print(f"- Writing patch parquet to: {patch_path}")
-    rerun_failed_doys_with_dask(
-        ids=ids,
-        failed_doys=doys_to_fix,
-        config=cfg,
-        climatology_path=climatology_path,
-        patch_output_path=patch_path,
+    dc = DaskAnomalyConfig(
+        n_workers=args.n_workers,
+        threads_per_worker=args.threads_per_worker,
+        memory_limit=args.memory_limit,
+        batch_size=args.submit_batch_size,
     )
 
-    # 5) Patch combined coefficients inplace
-    print("\nPatching combined coefficient parquet inplace...")
+    print("\nRetraining anomaly coefficients for failed DOYs only (bucketed Dask)...")
+    print(f"- Writing patch dataset to: {patch_path}")
+    rerun_failed_doys_with_bucketed_dask(
+        prepared_training_root=prepared_training_dir,
+        bucketed_climatology_root=bucketed_climatology_dir,
+        patch_output_root=patch_path,
+        failed_doys=doys_to_fix,
+        config=cfg,
+        dask_config=dc,
+    )
+
+    # 4) Patch coefficient dataset inplace
+    print("\nPatching coefficient dataset inplace...")
     print(f"- Base coeffs:  {coeffs_path}")
     print(f"- Patch coeffs: {patch_path}")
     summary = patch_anomaly_coeffs_inplace(

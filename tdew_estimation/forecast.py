@@ -56,14 +56,21 @@ Notes on correctness
 from __future__ import annotations
 
 import json
+import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
 
+from .bucket_layout import bucket_dir, discover_bucket_ids
+from .parquet_io import as_path, read_parquet_any
+
 PathLike = Union[str, Path]
+
+logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------------------
@@ -178,6 +185,140 @@ class ForecastConfig:
     tmin_v1_legacy_name: bool = True
 
 
+def generate_recursive_forecast_for_prepared_id(
+    location_id: int,
+    *,
+    coeffs_id_df: pd.DataFrame,
+    clim_id_df: pd.DataFrame,
+    history_df: pd.DataFrame,
+    future_tmin_df: pd.DataFrame,
+    prediction_years: Tuple[int, int],
+) -> Optional[pd.DataFrame]:
+    """
+    Recursive TD forecast for one ID from already-loaded per-ID frames.
+
+    This is the in-memory core shared by the per-ID disk path
+    (``generate_recursive_forecast_for_one_id``) and the bucketed Dask path
+    (``run_bucketed_forecast_dask``). It contains no I/O.
+
+    Parameters
+    ----------
+    coeffs_id_df:
+        Anomaly coefficients for this ID. Must contain: doy, const_anom,
+        TMIN_anom_coeff, TD_anom_lag1, TD_anom_lag2, TMIN_anom_lag1.
+    clim_id_df:
+        Climatology for this ID. Must contain: doy, TD_clim, TMIN_clim.
+    history_df:
+        Historical TD/TMIN used only to seed the two TD/TMIN lags. Must contain
+        FECHA, TD, TMIN with at least two rows (the last two by date are used).
+    future_tmin_df:
+        Exogenous TMIN over the forecast horizon. Must contain FECHA, TMIN.
+    prediction_years:
+        (start_year, end_year) inclusive forecast horizon.
+
+    Returns
+    -------
+    DataFrame with columns FECHA, ID, TD_predicted; an empty frame with those
+    columns if no day could be predicted; or None if required inputs are missing.
+    """
+    if coeffs_id_df is None or coeffs_id_df.empty or clim_id_df is None or clim_id_df.empty:
+        return None
+
+    required_coeff_cols = {"doy", "const_anom", "TMIN_anom_coeff", "TD_anom_lag1", "TD_anom_lag2", "TMIN_anom_lag1"}
+    if not required_coeff_cols.issubset(set(coeffs_id_df.columns)):
+        return None
+    required_clim_cols = {"doy", "TD_clim", "TMIN_clim"}
+    if not required_clim_cols.issubset(set(clim_id_df.columns)):
+        return None
+
+    if history_df is None or len(history_df) < 2:
+        return None
+    if future_tmin_df is None or future_tmin_df.empty:
+        return None
+
+    history_df = history_df.sort_values("FECHA")
+    last_two_days = history_df.tail(2)[["FECHA", "TD", "TMIN"]].copy().reset_index(drop=True)
+
+    # Index climatology and coeffs by DOY for fast lookup
+    clim_id = clim_id_df.copy()
+    clim_id["doy"] = pd.to_numeric(clim_id["doy"], errors="coerce").astype("Int64")
+    clim_id = clim_id.dropna(subset=["doy"]).copy()
+    clim_id["doy"] = clim_id["doy"].astype(int)
+    clim_id = clim_id.set_index("doy")
+
+    coeffs_id = coeffs_id_df.copy()
+    coeffs_id["doy"] = pd.to_numeric(coeffs_id["doy"], errors="coerce").astype("Int64")
+    coeffs_id = coeffs_id.dropna(subset=["doy"]).copy()
+    coeffs_id["doy"] = coeffs_id["doy"].astype(int)
+    coeffs_id = coeffs_id.set_index("doy")
+
+    future_tmin = future_tmin_df.copy()
+    future_tmin["FECHA"] = pd.to_datetime(future_tmin["FECHA"])
+    future_tmin = future_tmin.set_index("FECHA")
+
+    pred_start_year, pred_end_year = prediction_years
+    pred_range = (f"{pred_start_year}-01-01", f"{pred_end_year}-12-31")
+    prediction_dates = pd.date_range(start=pred_range[0], end=pred_range[1], freq="D")
+    predictions: List[Dict[str, object]] = []
+
+    def _doy(dt: pd.Timestamp) -> int:
+        return int(dt.dayofyear)
+
+    for current_day in prediction_dates:
+        doy = _doy(current_day)
+
+        # Require: coefficient and climatology for this DOY and future TMIN for this day
+        if doy not in clim_id.index or doy not in coeffs_id.index or current_day not in future_tmin.index:
+            continue
+
+        tmin_today = float(future_tmin.loc[current_day, "TMIN"])
+        td_lag1 = float(last_two_days.iloc[-1]["TD"])
+        td_lag2 = float(last_two_days.iloc[-2]["TD"])
+        tmin_lag1 = float(last_two_days.iloc[-1]["TMIN"])
+
+        # Climatology lookups (today, lag1, lag2)
+        clim_today = clim_id.loc[doy]
+
+        doy_lag1 = _doy(current_day - pd.Timedelta(days=1))
+        doy_lag2 = _doy(current_day - pd.Timedelta(days=2))
+        if doy_lag1 not in clim_id.index or doy_lag2 not in clim_id.index:
+            continue
+
+        clim_lag1 = clim_id.loc[doy_lag1]
+        clim_lag2 = clim_id.loc[doy_lag2]
+
+        # Anomalies
+        tmin_anom = tmin_today - float(clim_today["TMIN_clim"])
+        td_anom_lag1 = td_lag1 - float(clim_lag1["TD_clim"])
+        td_anom_lag2 = td_lag2 - float(clim_lag2["TD_clim"])
+        tmin_anom_lag1 = tmin_lag1 - float(clim_lag1["TMIN_clim"])
+
+        coeffs = coeffs_id.loc[doy]
+
+        predicted_anomaly = (
+            float(coeffs["const_anom"])
+            + (tmin_anom * float(coeffs["TMIN_anom_coeff"]))
+            + (td_anom_lag1 * float(coeffs["TD_anom_lag1"]))
+            + (td_anom_lag2 * float(coeffs["TD_anom_lag2"]))
+            + (tmin_anom_lag1 * float(coeffs["TMIN_anom_lag1"]))
+        )
+
+        predicted_td = predicted_anomaly + float(clim_today["TD_clim"])
+
+        predictions.append(
+            {"FECHA": current_day, "ID": int(location_id), "TD_predicted": float(predicted_td)}
+        )
+
+        # Update rolling window (keep last two days)
+        new_row = pd.DataFrame([{"FECHA": current_day, "TD": predicted_td, "TMIN": tmin_today}])
+        last_two_days = pd.concat([last_two_days.iloc[1:], new_row], ignore_index=True)
+
+    if not predictions:
+        return pd.DataFrame(columns=["FECHA", "ID", "TD_predicted"])
+
+    return pd.DataFrame(predictions)
+
+
 def generate_recursive_forecast_for_one_id(
     location_id: int,
     *,
@@ -267,8 +408,6 @@ def generate_recursive_forecast_for_one_id(
     if len(history_df) < 2:
         return None
 
-    last_two_days = history_df.tail(2).copy().reset_index(drop=True)
-
     # Load future tmin for forecast horizon
     pred_start_year, pred_end_year = prediction_years
     pred_range = (f"{pred_start_year}-01-01", f"{pred_end_year}-12-31")
@@ -286,83 +425,15 @@ def generate_recursive_forecast_for_one_id(
     if future_tmin.empty:
         return None
 
-    # Index climatology and coeffs by DOY for fast lookup
-    clim_id = clim_df.copy()
-    clim_id["doy"] = pd.to_numeric(clim_id["doy"], errors="coerce").astype("Int64")
-    clim_id = clim_id.dropna(subset=["doy"]).copy()
-    clim_id["doy"] = clim_id["doy"].astype(int)
-    clim_id = clim_id.set_index("doy")
-
-    coeffs_id = coeffs_df.copy()
-    coeffs_id["doy"] = pd.to_numeric(coeffs_id["doy"], errors="coerce").astype("Int64")
-    coeffs_id = coeffs_id.dropna(subset=["doy"]).copy()
-    coeffs_id["doy"] = coeffs_id["doy"].astype(int)
-    coeffs_id = coeffs_id.set_index("doy")
-
-    future_tmin = future_tmin.copy()
-    future_tmin["FECHA"] = pd.to_datetime(future_tmin["FECHA"])
-    future_tmin = future_tmin.set_index("FECHA")
-
-    prediction_dates = pd.date_range(start=pred_range[0], end=pred_range[1], freq="D")
-    predictions: List[Dict[str, object]] = []
-
-    # Precompute DOY function
-    def _doy(dt: pd.Timestamp) -> int:
-        return int(dt.dayofyear)
-
-    for current_day in prediction_dates:
-        doy = _doy(current_day)
-
-        # Require: coefficient and climatology for this DOY and future TMIN for this day
-        if doy not in clim_id.index or doy not in coeffs_id.index or current_day not in future_tmin.index:
-            continue
-
-        tmin_today = float(future_tmin.loc[current_day, "TMIN"])
-        td_lag1 = float(last_two_days.iloc[-1]["TD"])
-        td_lag2 = float(last_two_days.iloc[-2]["TD"])
-        tmin_lag1 = float(last_two_days.iloc[-1]["TMIN"])
-
-        # Climatology lookups (today, lag1, lag2)
-        clim_today = clim_id.loc[doy]
-
-        doy_lag1 = _doy(current_day - pd.Timedelta(days=1))
-        doy_lag2 = _doy(current_day - pd.Timedelta(days=2))
-        if doy_lag1 not in clim_id.index or doy_lag2 not in clim_id.index:
-            continue
-
-        clim_lag1 = clim_id.loc[doy_lag1]
-        clim_lag2 = clim_id.loc[doy_lag2]
-
-        # Anomalies
-        tmin_anom = tmin_today - float(clim_today["TMIN_clim"])
-        td_anom_lag1 = td_lag1 - float(clim_lag1["TD_clim"])
-        td_anom_lag2 = td_lag2 - float(clim_lag2["TD_clim"])
-        tmin_anom_lag1 = tmin_lag1 - float(clim_lag1["TMIN_clim"])
-
-        coeffs = coeffs_id.loc[doy]
-
-        predicted_anomaly = (
-            float(coeffs["const_anom"])
-            + (tmin_anom * float(coeffs["TMIN_anom_coeff"]))
-            + (td_anom_lag1 * float(coeffs["TD_anom_lag1"]))
-            + (td_anom_lag2 * float(coeffs["TD_anom_lag2"]))
-            + (tmin_anom_lag1 * float(coeffs["TMIN_anom_lag1"]))
-        )
-
-        predicted_td = predicted_anomaly + float(clim_today["TD_clim"])
-
-        predictions.append(
-            {"FECHA": current_day, "ID": int(location_id), "TD_predicted": float(predicted_td)}
-        )
-
-        # Update rolling window (keep last two days)
-        new_row = pd.DataFrame([{"FECHA": current_day, "ID": location_id, "TD": predicted_td, "TMIN": tmin_today}])
-        last_two_days = pd.concat([last_two_days.iloc[1:], new_row], ignore_index=True)
-
-    if not predictions:
-        return pd.DataFrame(columns=["FECHA", "ID", "TD_predicted"])
-
-    return pd.DataFrame(predictions)
+    # Delegate the (I/O-free) recursion to the shared in-memory core.
+    return generate_recursive_forecast_for_prepared_id(
+        location_id,
+        coeffs_id_df=coeffs_df,
+        clim_id_df=clim_df,
+        history_df=history_df,
+        future_tmin_df=future_tmin,
+        prediction_years=prediction_years,
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -374,11 +445,68 @@ def generate_recursive_forecast_for_one_id(
 class DaskForecastConfig:
     """
     Dask configuration for distributed forecasting.
+
+    Parameters
+    ----------
+    n_workers:
+        Number of Dask worker processes (set to physical cores for CPU-bound work).
+    threads_per_worker:
+        Threads per worker. Default 1: forecasting is pure-Python + NumPy/BLAS, so
+        extra threads contend on the GIL and oversubscribe BLAS. See
+        ``_configure_blas_threads``.
+    memory_limit:
+        Per-worker memory limit, "auto", or None. "auto" splits the machine's total
+        memory across workers instead of hard-coding a value that can oversubscribe RAM.
+    batch_size:
+        Number of IDs per batch (chunk file). Bounds driver memory because each batch's
+        per-ID results are concatenated before being written.
+    local_directory:
+        Worker scratch/spill directory; on HPC point this at fast node-local storage.
+    dashboard_address:
+        Address for the Dask dashboard, or None to disable.
+    task_retries:
+        Number of times the scheduler retries a task that fails on a worker
+        (used by the bucketed path). 0 disables retries.
     """
     n_workers: int = 8
-    threads_per_worker: int = 4
-    memory_limit: Optional[str] = "16GB"
-    batch_size: int = 500  # number of IDs per batch (chunk file)
+    threads_per_worker: int = 1
+    memory_limit: Optional[str] = "auto"
+    batch_size: int = 500  # number of IDs per batch (chunk file); also the bucket in-flight window
+    local_directory: Optional[str] = None
+    dashboard_address: Optional[str] = ":8787"
+    task_retries: int = 2
+
+
+def _configure_blas_threads() -> None:
+    """
+    Pin BLAS/OpenMP thread pools to one thread per worker process so nested BLAS
+    threads do not oversubscribe the CPU. ``setdefault`` lets an explicit shell env
+    var win; must run before the Client (and its workers) are created.
+    """
+    for var in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    ):
+        os.environ.setdefault(var, "1")
+
+
+def _make_forecast_client(dc: DaskForecastConfig):
+    """Create a local Dask distributed Client from a DaskForecastConfig."""
+    from dask.distributed import Client
+
+    kwargs = dict(
+        n_workers=dc.n_workers,
+        threads_per_worker=dc.threads_per_worker,
+        memory_limit=dc.memory_limit,
+    )
+    if dc.local_directory:
+        kwargs["local_directory"] = dc.local_directory
+    if dc.dashboard_address is not None:
+        kwargs["dashboard_address"] = dc.dashboard_address
+    return Client(**kwargs)
 
 
 def forecast_with_dask(
@@ -392,20 +520,27 @@ def forecast_with_dask(
     dask_config: Optional[DaskForecastConfig] = None,
     chunk_dir: PathLike,
     chunk_prefix: str = "pred_batch_",
+    client: Optional[Any] = None,
 ) -> List[Path]:
     """
     Run recursive forecasts across many IDs using Dask and write chunk parquet files.
 
+    If ``client`` is provided it is reused (and left open); otherwise a local cluster
+    is created from ``dask_config`` and closed on exit.
+
     Returns list of chunk file paths written.
     """
-    from dask.distributed import Client, as_completed  # imported lazily
+    from dask.distributed import as_completed  # imported lazily
 
     dc = dask_config or DaskForecastConfig()
     chunk_dir_p = Path(chunk_dir).expanduser().resolve()
     chunk_dir_p.mkdir(parents=True, exist_ok=True)
 
     written: List[Path] = []
-    client = Client(n_workers=dc.n_workers, threads_per_worker=dc.threads_per_worker, memory_limit=dc.memory_limit)
+    _configure_blas_threads()
+    owns_client = client is None
+    if client is None:
+        client = _make_forecast_client(dc)
 
     try:
         # Process IDs in batches to keep memory stable
@@ -442,9 +577,264 @@ def forecast_with_dask(
                 written.append(out_file)
 
     finally:
-        client.close()
+        if owns_client:
+            client.close()
 
     return written
+
+
+# --------------------------------------------------------------------------------------
+# Bucketed Dask scaling (reads each coeffs/climatology/history/future-TMIN shard once)
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ForecastBucketSummary:
+    bucket_id: int
+    id_count: int
+    pred_rows: int
+    status: str
+    predictions_path: Path
+
+
+def _error_forecast_summary(
+    bucket_id: int,
+    predictions_output_root: Path,
+    exc: BaseException,
+) -> ForecastBucketSummary:
+    """Summary for a bucket whose task raised on the driver side (e.g. KilledWorker)."""
+    if bucket_id is not None and bucket_id >= 0:
+        pred_file = bucket_dir(predictions_output_root, bucket_id) / "pred.parquet"
+    else:
+        pred_file = predictions_output_root
+    return ForecastBucketSummary(
+        bucket_id=int(bucket_id),
+        id_count=0,
+        pred_rows=0,
+        status=f"error:{type(exc).__name__}",
+        predictions_path=pred_file,
+    )
+
+
+def _groups_by_id(df: pd.DataFrame) -> Dict[int, pd.DataFrame]:
+    """Group a frame by integer ID into a dict, tolerant of missing/odd ID values."""
+    if df is None or df.empty or "ID" not in df.columns:
+        return {}
+    out = df.copy()
+    out["ID"] = pd.to_numeric(out["ID"], errors="coerce").astype("Int64")
+    out = out.dropna(subset=["ID"])
+    out["ID"] = out["ID"].astype(int)
+    return {int(k): v for k, v in out.groupby("ID", sort=True)}
+
+
+def _forecast_bucket_task(
+    *,
+    bucket_id: int,
+    coeffs_root: PathLike,
+    climatology_root: PathLike,
+    prepared_training_root: PathLike,
+    future_tmin_root: PathLike,
+    predictions_output_root: PathLike,
+    prediction_years: Tuple[int, int],
+    history_end_year: int,
+    overwrite: bool = False,
+) -> ForecastBucketSummary:
+    """
+    Worker task: forecast every ID in one bucket and write its predictions directly.
+
+    Each input shard for the bucket is read exactly once:
+    - coeffs:       ``coeffs_root/id_bucket=XXXX/coeffs.parquet`` (from training)
+    - climatology:  ``climatology_root/id_bucket=XXXX/climatology.parquet``
+    - history:      ``prepared_training_root/id_bucket=XXXX/`` filtered to history_end_year
+    - future TMIN:  ``future_tmin_root/id_bucket=XXXX/`` (forecast-horizon exogenous)
+    """
+    pred_dir = bucket_dir(predictions_output_root, bucket_id)
+    pred_dir.mkdir(parents=True, exist_ok=True)
+    pred_file = pred_dir / "pred.parquet"
+
+    if pred_file.exists() and not overwrite:
+        return ForecastBucketSummary(
+            bucket_id=int(bucket_id), id_count=0, pred_rows=0,
+            status="skipped", predictions_path=pred_file,
+        )
+
+    coeffs_file = bucket_dir(coeffs_root, bucket_id) / "coeffs.parquet"
+    clim_file = bucket_dir(climatology_root, bucket_id) / "climatology.parquet"
+    if not coeffs_file.exists() or not clim_file.exists():
+        return ForecastBucketSummary(
+            bucket_id=int(bucket_id), id_count=0, pred_rows=0,
+            status="missing_inputs", predictions_path=pred_file,
+        )
+
+    coeffs_df = pd.read_parquet(coeffs_file)
+    clim_df = pd.read_parquet(clim_file)
+
+    # History: read the prepared training shard, keep only history_end_year.
+    history_df = read_parquet_any(bucket_dir(prepared_training_root, bucket_id))
+    history_df["FECHA"] = pd.to_datetime(history_df["FECHA"])
+    history_df = history_df[history_df["FECHA"].dt.year == int(history_end_year)]
+
+    # Future exogenous TMIN over the forecast horizon.
+    future_tmin_df = read_parquet_any(bucket_dir(future_tmin_root, bucket_id))
+    future_tmin_df["FECHA"] = pd.to_datetime(future_tmin_df["FECHA"])
+
+    coeffs_by_id = _groups_by_id(coeffs_df)
+    clim_by_id = _groups_by_id(clim_df)
+    hist_by_id = _groups_by_id(history_df)
+    ftmin_by_id = _groups_by_id(future_tmin_df)
+
+    frames: List[pd.DataFrame] = []
+    id_count = 0
+    for location_id, coeffs_id_df in coeffs_by_id.items():
+        id_count += 1
+        df = generate_recursive_forecast_for_prepared_id(
+            location_id,
+            coeffs_id_df=coeffs_id_df,
+            clim_id_df=clim_by_id.get(location_id, pd.DataFrame()),
+            history_df=hist_by_id.get(location_id, pd.DataFrame()),
+            future_tmin_df=ftmin_by_id.get(location_id, pd.DataFrame()),
+            prediction_years=prediction_years,
+        )
+        if df is not None and not df.empty:
+            frames.append(df)
+
+    if frames:
+        pred = pd.concat(frames, ignore_index=True).sort_values(["ID", "FECHA"]).reset_index(drop=True)
+        pred.to_parquet(pred_file, engine="pyarrow", index=False)
+        status = "ok"
+        pred_rows = len(pred)
+    else:
+        if overwrite and pred_file.exists():
+            pred_file.unlink()
+        status = "empty"
+        pred_rows = 0
+
+    return ForecastBucketSummary(
+        bucket_id=int(bucket_id),
+        id_count=int(id_count),
+        pred_rows=int(pred_rows),
+        status=status,
+        predictions_path=pred_file,
+    )
+
+
+def run_bucketed_forecast_dask(
+    *,
+    coeffs_root: PathLike,
+    climatology_root: PathLike,
+    prepared_training_root: PathLike,
+    future_tmin_root: PathLike,
+    predictions_output_root: PathLike,
+    prediction_years: Tuple[int, int],
+    history_end_year: int,
+    bucket_ids: Optional[Sequence[int]] = None,
+    dask_config: Optional[DaskForecastConfig] = None,
+    overwrite: bool = False,
+    client: Optional[Any] = None,
+) -> List[ForecastBucketSummary]:
+    """
+    Recursive forecast by bucket. Mirrors ``run_bucketed_anomaly_training_dask``: each
+    worker task forecasts all IDs in one bucket, reading each input shard once.
+
+    Bucket tasks use a sliding window (``dask_config.batch_size`` in flight) consumed
+    with ``as_completed``; a bucket that fails on a worker is recorded as an error
+    summary and skipped rather than aborting the run. If ``client`` is provided it is
+    reused (and left open); otherwise a local cluster is created and closed on exit.
+    """
+    from dask.distributed import as_completed  # imported lazily
+
+    dc = dask_config or DaskForecastConfig()
+    coeffs_root_p = as_path(coeffs_root)
+    climatology_root_p = as_path(climatology_root)
+    prepared_root_p = as_path(prepared_training_root)
+    future_tmin_root_p = as_path(future_tmin_root)
+    predictions_root_p = as_path(predictions_output_root)
+    predictions_root_p.mkdir(parents=True, exist_ok=True)
+
+    if bucket_ids is None:
+        buckets_to_run = discover_bucket_ids(coeffs_root_p)
+    else:
+        buckets_to_run = sorted({int(b) for b in bucket_ids})
+    if not buckets_to_run:
+        raise ValueError(f"No buckets found under {coeffs_root_p}")
+
+    _configure_blas_threads()
+    owns_client = client is None
+    if client is None:
+        client = _make_forecast_client(dc)
+
+    window = dc.batch_size if dc.batch_size and dc.batch_size > 0 else len(buckets_to_run)
+    max_in_flight = max(window, dc.n_workers)
+
+    def _submit(bucket_id: int):
+        return client.submit(
+            _forecast_bucket_task,
+            bucket_id=int(bucket_id),
+            coeffs_root=coeffs_root_p,
+            climatology_root=climatology_root_p,
+            prepared_training_root=prepared_root_p,
+            future_tmin_root=future_tmin_root_p,
+            predictions_output_root=predictions_root_p,
+            prediction_years=prediction_years,
+            history_end_year=history_end_year,
+            overwrite=overwrite,
+            pure=False,
+            retries=dc.task_retries,
+        )
+
+    summaries: List[ForecastBucketSummary] = []
+    pending: Dict[Any, int] = {}
+    next_idx = 0
+    try:
+        ac = as_completed()
+        while next_idx < len(buckets_to_run) and len(pending) < max_in_flight:
+            bid = buckets_to_run[next_idx]
+            fut = _submit(bid)
+            pending[fut] = bid
+            ac.add(fut)
+            next_idx += 1
+
+        for fut in ac:
+            bid = pending.pop(fut, -1)
+            try:
+                summaries.append(fut.result())
+            except Exception as exc:
+                logger.warning("Forecast bucket %s failed: %s: %s", bid, type(exc).__name__, exc)
+                summaries.append(_error_forecast_summary(bid, predictions_root_p, exc))
+
+            if next_idx < len(buckets_to_run):
+                bid = buckets_to_run[next_idx]
+                fut = _submit(bid)
+                pending[fut] = bid
+                ac.add(fut)
+                next_idx += 1
+    finally:
+        if owns_client:
+            client.close()
+
+    return sorted(summaries, key=lambda item: item.bucket_id)
+
+
+def combine_bucketed_predictions(
+    predictions_root: PathLike,
+    *,
+    output_file: PathLike,
+) -> Path:
+    """
+    Combine per-bucket prediction shards (``id_bucket=XXXX/pred.parquet``) into a
+    single parquet with columns FECHA, ID, TD_predicted.
+    """
+    root = as_path(predictions_root)
+    out = Path(output_file).expanduser().resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    final_df = read_parquet_any(root)
+    # read_parquet_any infers a hive "id_bucket" column from the shard paths; drop it
+    # so predictions keep their canonical schema (FECHA, ID, TD_predicted).
+    if "id_bucket" in final_df.columns:
+        final_df = final_df.drop(columns=["id_bucket"])
+    final_df = final_df.sort_values(["ID", "FECHA"]).reset_index(drop=True)
+    final_df.to_parquet(out, engine="pyarrow", index=False)
+    return out
 
 
 def combine_prediction_chunks(

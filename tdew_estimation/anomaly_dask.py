@@ -65,6 +65,9 @@ run_anomaly_training_dask(
 
 from __future__ import annotations
 
+import logging
+import os
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Optional, Sequence, Set, Union
@@ -81,6 +84,8 @@ from .parquet_io import as_path, read_parquet_any
 
 PathLike = Union[str, Path]
 
+logger = logging.getLogger(__name__)
+
 
 def _as_path(p: PathLike) -> Path:
     return as_path(p)
@@ -94,23 +99,81 @@ class DaskAnomalyConfig:
     Parameters
     ----------
     n_workers:
-        Number of Dask workers.
+        Number of Dask worker processes. For CPU-bound model fitting, set this to
+        the number of physical cores available (one single-threaded process per core).
     threads_per_worker:
-        Threads per worker.
+        Threads per worker. Default 1: the fitting loop is pure-Python + NumPy/BLAS,
+        so extra threads contend on the GIL and oversubscribe BLAS. Parallelism comes
+        from running many worker *processes* instead.
     memory_limit:
-        Per-worker memory limit string (e.g., "16GB") or None.
+        Per-worker memory limit string (e.g., "16GB"), "auto", or None. Default "auto"
+        lets Dask split the machine's total memory evenly across workers, which avoids
+        oversubscribing RAM (n_workers * 16GB) on smaller nodes.
     batch_size:
-        Submission batch size. In the legacy per-ID path it means IDs per output chunk;
-        in the bucketed path it means bucket tasks submitted at once.
+        In the legacy per-ID path: IDs per output chunk (bounds driver memory).
+        In the bucketed path: the maximum number of bucket tasks kept in flight at
+        once (a sliding window, NOT a hard barrier between groups).
     scheduler_timeout_s:
         Timeout for workers to connect in seconds.
+    local_directory:
+        Directory for worker scratch/spill. On HPC set this to fast node-local storage
+        (e.g. $TMPDIR) so spilling does not hit a networked filesystem. None uses the
+        Dask default (current working directory).
+    dashboard_address:
+        Address for the Dask dashboard (e.g. ":8787"). Set to a free port per job on
+        shared nodes, or None to disable.
+    task_retries:
+        Number of times the scheduler retries a task that fails on a worker (e.g. a
+        transient KilledWorker). 0 disables retries.
     """
 
     n_workers: int = 8
-    threads_per_worker: int = 4
-    memory_limit: Optional[str] = "16GB"
+    threads_per_worker: int = 1
+    memory_limit: Optional[str] = "auto"
     batch_size: int = 1000
     scheduler_timeout_s: int = 120
+    local_directory: Optional[str] = None
+    dashboard_address: Optional[str] = ":8787"
+    task_retries: int = 2
+
+
+def _configure_blas_threads() -> None:
+    """
+    Pin BLAS/OpenMP thread pools to a single thread.
+
+    statsmodels/NumPy fits call into BLAS, which spawns its own thread pool. With many
+    Dask worker processes each fitting models, those nested BLAS threads oversubscribe
+    the CPU and thrash cache. We run one BLAS thread per worker process and rely on
+    Dask for parallelism. ``setdefault`` lets an explicit shell env var win, and this
+    must run before workers are spawned (i.e. before the Client is created) so the
+    spawned worker processes inherit the values.
+    """
+    for var in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    ):
+        os.environ.setdefault(var, "1")
+
+
+def _make_client(dc: DaskAnomalyConfig):
+    """Create a local Dask distributed Client from a DaskAnomalyConfig."""
+    from dask.distributed import Client
+
+    kwargs = dict(
+        n_workers=dc.n_workers,
+        threads_per_worker=dc.threads_per_worker,
+        memory_limit=dc.memory_limit,
+        timeout=f"{dc.scheduler_timeout_s}s",
+    )
+    if dc.local_directory:
+        kwargs["local_directory"] = dc.local_directory
+    if dc.dashboard_address is not None:
+        kwargs["dashboard_address"] = dc.dashboard_address
+    return Client(**kwargs)
+
 
 def _normalize_doys(doys: Optional[Sequence[int]]) -> Optional[Set[int]]:
     if doys is None:
@@ -149,6 +212,30 @@ class BucketTrainingSummary:
     status: str
     coeffs_path: Path
     failures_path: Optional[Path]
+
+
+def _error_bucket_summary(
+    bucket_id: int,
+    coeffs_output_root: Path,
+    exc: BaseException,
+) -> BucketTrainingSummary:
+    """
+    Build a summary for a bucket whose task raised on the driver side (e.g. a
+    KilledWorker or serialization error), so one bad bucket does not abort the run.
+    """
+    if bucket_id is not None and bucket_id >= 0:
+        coeffs_file = bucket_dir(coeffs_output_root, bucket_id) / "coeffs.parquet"
+    else:
+        coeffs_file = coeffs_output_root
+    return BucketTrainingSummary(
+        bucket_id=int(bucket_id),
+        id_count=0,
+        coeff_rows=0,
+        failure_rows=0,
+        status=f"error:{type(exc).__name__}",
+        coeffs_path=coeffs_file,
+        failures_path=None,
+    )
 
 
 def _failure_row(
@@ -324,6 +411,7 @@ def run_anomaly_training_dask(
     chunk_prefix: str = "batch_",
     overwrite_chunks: bool = False,
     persist_climatology_on_workers: bool = True,
+    client: Optional[Any] = None,
 ) -> List[Path]:
     """
     Run anomaly training across many IDs using Dask and write chunk parquet outputs.
@@ -350,13 +438,28 @@ def run_anomaly_training_dask(
         If False, existing chunk files are skipped.
     persist_climatology_on_workers:
         If True, scatters climatology to workers once (broadcast) and passes a future to tasks.
+    client:
+        Optional existing Dask Client to reuse. If None, a local cluster is created from
+        ``dask_config`` and closed on exit; a passed-in client is left open for the caller.
 
     Returns
     -------
     List[Path]
         Paths of chunk files written (or already present if skipped).
+
+    .. deprecated::
+        This per-ID path re-opens every monthly parquet for every ID
+        (O(N_ids x N_files) reads). Use ``run_bucketed_anomaly_training_dask``, which
+        reads each bucket shard once. Build inputs first with
+        ``tdew_estimation.bucketed_data.build_bucketed_training_dataset``.
     """
-    from dask.distributed import Client, as_completed  # imported lazily
+    warnings.warn(
+        "run_anomaly_training_dask (per-ID) is deprecated and O(N_ids x N_files) slow; "
+        "use run_bucketed_anomaly_training_dask.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    from dask.distributed import as_completed  # imported lazily
 
     dc = dask_config or DaskAnomalyConfig()
     chunk_dir_p = _as_path(chunk_dir)
@@ -370,13 +473,11 @@ def run_anomaly_training_dask(
     climatology_df = pd.read_parquet(clim_path)
     doys_set = _normalize_doys(doys)
 
-    # Start Dask client (local cluster via distributed defaults)
-    client = Client(
-        n_workers=dc.n_workers,
-        threads_per_worker=dc.threads_per_worker,
-        memory_limit=dc.memory_limit,
-        timeout=f"{dc.scheduler_timeout_s}s",
-    )
+    # Start Dask client (local cluster) unless one was supplied by the caller.
+    _configure_blas_threads()
+    owns_client = client is None
+    if client is None:
+        client = _make_client(dc)
 
     chunk_paths: List[Path] = []
 
@@ -435,7 +536,8 @@ def run_anomaly_training_dask(
             _combine_chunks(chunk_paths, out_p)
 
     finally:
-        client.close()
+        if owns_client:
+            client.close()
 
     return chunk_paths
 
@@ -451,14 +553,23 @@ def run_bucketed_anomaly_training_dask(
     dask_config: Optional[DaskAnomalyConfig] = None,
     failure_output_root: Optional[PathLike] = None,
     overwrite: bool = False,
+    client: Optional[Any] = None,
 ) -> List[BucketTrainingSummary]:
     """
     Run anomaly training by bucket instead of by individual ID.
 
     Each worker task reads one bucket shard of the prepared training dataset, fits
     all IDs inside that bucket, and writes its own parquet output directly.
+
+    Bucket tasks are submitted with a sliding window (``dask_config.batch_size``
+    futures in flight) and consumed with ``as_completed`` as they finish, so a slow
+    bucket never blocks the rest of the fleet. A bucket whose task fails on a worker
+    is recorded as an error summary and skipped rather than aborting the whole run.
+
+    If ``client`` is provided it is reused (and left open); otherwise a local cluster
+    is created from ``dask_config`` and closed on exit.
     """
-    from dask.distributed import Client, as_completed  # imported lazily
+    from dask.distributed import as_completed  # imported lazily
 
     dc = dask_config or DaskAnomalyConfig()
     prepared_root_p = as_path(prepared_training_root)
@@ -476,36 +587,64 @@ def run_bucketed_anomaly_training_dask(
     if not buckets_to_run:
         raise ValueError(f"No buckets found under {prepared_root_p}")
 
-    client = Client(
-        n_workers=dc.n_workers,
-        threads_per_worker=dc.threads_per_worker,
-        memory_limit=dc.memory_limit,
-        timeout=f"{dc.scheduler_timeout_s}s",
-    )
+    _configure_blas_threads()
+    owns_client = client is None
+    if client is None:
+        client = _make_client(dc)
+
+    # Keep at most `max_in_flight` tasks queued at once: large enough to keep every
+    # worker busy, bounded so the scheduler graph stays small. This is a sliding
+    # window, not a hard barrier between groups.
+    window = dc.batch_size if dc.batch_size and dc.batch_size > 0 else len(buckets_to_run)
+    max_in_flight = max(window, dc.n_workers)
+
+    def _submit(bucket_id: int):
+        return client.submit(
+            _train_anomaly_bucket_task,
+            bucket_id=int(bucket_id),
+            prepared_training_root=prepared_root_p,
+            bucketed_climatology_root=bucketed_clim_root_p,
+            coeffs_output_root=coeffs_root_p,
+            config=config,
+            doys=doys,
+            failure_output_root=failure_root_p,
+            overwrite=overwrite,
+            pure=False,
+            retries=dc.task_retries,
+        )
 
     summaries: List[BucketTrainingSummary] = []
+    pending: dict[Any, int] = {}
+    next_idx = 0
     try:
-        for offset in range(0, len(buckets_to_run), dc.batch_size):
-            bucket_batch = buckets_to_run[offset : offset + dc.batch_size]
-            futures = [
-                client.submit(
-                    _train_anomaly_bucket_task,
-                    bucket_id=int(bucket_id),
-                    prepared_training_root=prepared_root_p,
-                    bucketed_climatology_root=bucketed_clim_root_p,
-                    coeffs_output_root=coeffs_root_p,
-                    config=config,
-                    doys=doys,
-                    failure_output_root=failure_root_p,
-                    overwrite=overwrite,
-                    pure=False,
-                )
-                for bucket_id in bucket_batch
-            ]
-            for fut in as_completed(futures):
+        ac = as_completed()
+        # Prime the sliding window.
+        while next_idx < len(buckets_to_run) and len(pending) < max_in_flight:
+            bid = buckets_to_run[next_idx]
+            fut = _submit(bid)
+            pending[fut] = bid
+            ac.add(fut)
+            next_idx += 1
+
+        for fut in ac:
+            bid = pending.pop(fut, -1)
+            try:
                 summaries.append(fut.result())
+            except Exception as exc:
+                # A single bucket failure (e.g. KilledWorker) must not abort the run.
+                logger.warning("Bucket %s failed: %s: %s", bid, type(exc).__name__, exc)
+                summaries.append(_error_bucket_summary(bid, coeffs_root_p, exc))
+
+            # Top up the window with the next bucket, if any remain.
+            if next_idx < len(buckets_to_run):
+                bid = buckets_to_run[next_idx]
+                fut = _submit(bid)
+                pending[fut] = bid
+                ac.add(fut)
+                next_idx += 1
     finally:
-        client.close()
+        if owns_client:
+            client.close()
 
     return sorted(summaries, key=lambda item: item.bucket_id)
 
@@ -520,6 +659,7 @@ def rerun_failed_doys_with_bucketed_dask(
     dask_config: Optional[DaskAnomalyConfig] = None,
     failure_output_root: Optional[PathLike] = None,
     bucket_ids: Optional[Sequence[int]] = None,
+    client: Optional[Any] = None,
 ) -> List[BucketTrainingSummary]:
     """
     Retrain only selected DOYs using the bucket-based execution path.
@@ -534,6 +674,7 @@ def rerun_failed_doys_with_bucketed_dask(
         dask_config=dask_config,
         failure_output_root=failure_output_root,
         overwrite=True,
+        client=client,
     )
 
 
@@ -546,6 +687,7 @@ def rerun_failed_doys_with_dask(
     patch_output_path: PathLike,
     dask_config: Optional[DaskAnomalyConfig] = None,
     temp_chunk_dir: Optional[PathLike] = None,
+    client: Optional[Any] = None,
 ) -> Path:
     """
     Convenience wrapper: retrain anomaly coefficients ONLY for failed DOYs and write a single patch parquet.
@@ -576,7 +718,17 @@ def rerun_failed_doys_with_dask(
     -------
     Path
         Path to written patch parquet.
+
+    .. deprecated::
+        Built on the per-ID ``run_anomaly_training_dask`` (O(N_ids x N_files) reads).
+        Use ``rerun_failed_doys_with_bucketed_dask`` instead.
     """
+    warnings.warn(
+        "rerun_failed_doys_with_dask (per-ID) is deprecated and O(N_ids x N_files) slow; "
+        "use rerun_failed_doys_with_bucketed_dask.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     patch_p = _as_path(patch_output_path)
     if temp_chunk_dir is None:
         chunk_dir = patch_p.parent / f"{patch_p.stem}_chunks"
@@ -594,6 +746,7 @@ def rerun_failed_doys_with_dask(
         dask_config=dask_config,
         chunk_prefix="patch_batch_",
         overwrite_chunks=True,
+        client=client,
     )
     # combine_output_path already wrote patch_p
     if not patch_p.exists():

@@ -637,3 +637,5 @@ This keeps the repair step small and avoids re-running the full 366-DOY training
 - Direct NumPy weighted least-squares to reduce `statsmodels` overhead
 - Forecast refactor to use the same bucketed data layout as training
 - A dedicated CLI entrypoint (thin layer over the extracted modules)
+- Rolling-origin, time-blocked cross-validation on a representative subset of IDs for tuning `h`, kernels, and version-shift corrections
+- Testing whether a single global `h` is sufficient or whether broad macro-regions in Peru should use different `h` values, adopting regional bandwidths only if validation shows a clear gain

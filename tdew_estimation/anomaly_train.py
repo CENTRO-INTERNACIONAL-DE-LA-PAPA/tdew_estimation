@@ -72,6 +72,7 @@ Performance notes
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
@@ -473,7 +474,21 @@ def train_anomaly_coeffs_for_one_id(
     Optional[pd.DataFrame]
         Coefficients dataframe for this ID. Columns include ID, doy, and coefficients.
         Returns None if no models could be trained.
+
+    .. deprecated::
+        This per-ID entry point re-opens every monthly parquet for every ID
+        (O(N_ids x N_files) reads). Use the bucketed path instead: build inputs with
+        ``tdew_estimation.bucketed_data.build_bucketed_training_dataset`` and train with
+        ``tdew_estimation.anomaly_dask.run_bucketed_anomaly_training_dask``. The in-memory
+        core ``fit_anomaly_coeffs_for_prepared_id`` remains the supported building block.
     """
+    warnings.warn(
+        "train_anomaly_coeffs_for_one_id (per-ID) is deprecated and O(N_ids x N_files) "
+        "slow; use the bucketed path "
+        "(build_bucketed_training_dataset + run_bucketed_anomaly_training_dask).",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     required_cols = ["ID", "FECHA", "Value"]
 
     # Discover parquet files

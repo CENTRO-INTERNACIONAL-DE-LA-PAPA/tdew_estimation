@@ -27,7 +27,7 @@ Inspiration / related work:
 You have two ways to run the pipeline:
 
 - **Recommended**: run the one-shot helper script:
-  - `scripts/run_pipeline.sh`
+  - `Local/run_pipeline.sh`
 - **Manual**: call the Python modules directly if you want to inspect or customize each phase
 
 ### Environment (recommended)
@@ -56,7 +56,7 @@ The helper script runs:
 7) patch + re-check
 
 ```bash
-bash scripts/run_pipeline.sh \
+bash Local/run_pipeline.sh \
   --base "/path/to/base" \
   --results "/path/to/results" \
   --grid "/path/to/grid.dbf" \
@@ -79,13 +79,13 @@ Outputs written under `--results`:
 Useful flags:
 ```bash
 # print resolved settings, don’t run heavy steps
-DRY_RUN=1 bash scripts/run_pipeline.sh --base "$BASE" --results "$RESULTS" --grid "$GRID"
+DRY_RUN=1 bash Local/run_pipeline.sh --base "$BASE" --results "$RESULTS" --grid "$GRID"
 
 # if you already prepared the bucketed inputs and only want model fitting
-bash scripts/run_pipeline.sh --base "$BASE" --results "$RESULTS" --grid "$GRID" --skip-climatology --skip-prepare --skip-patch
+bash Local/run_pipeline.sh --base "$BASE" --results "$RESULTS" --grid "$GRID" --skip-climatology --skip-prepare --skip-patch
 
 # rebuild bucketed training shards and overwrite coefficient outputs
-bash scripts/run_pipeline.sh --base "$BASE" --results "$RESULTS" --grid "$GRID" --overwrite-prepared --overwrite-clim-buckets --overwrite-train-output
+bash Local/run_pipeline.sh --base "$BASE" --results "$RESULTS" --grid "$GRID" --overwrite-prepared --overwrite-clim-buckets --overwrite-train-output
 ```
 
 ### Option B (manual): run each step

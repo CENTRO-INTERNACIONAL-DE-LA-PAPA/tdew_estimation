@@ -246,3 +246,142 @@ def shard_climatology_by_bucket(
         num_buckets=num_buckets,
         shards_written=shards_written,
     )
+
+
+@dataclass(frozen=True)
+class BucketedForecastTminResult:
+    output_dir: Path
+    year_range: Tuple[int, int]
+    num_buckets: int
+    years_processed: int
+    bucket_files_written: int
+
+
+def _read_monthly_future_tmin(
+    *,
+    base_path: PathLike,
+    future_tmin_var: str,
+    outputs_subdir: str,
+    month_start: pd.Timestamp,
+) -> Optional[DataFrame]:
+    date_range = _month_range_strings(month_start)
+    files = find_parquet_files(
+        base_path,
+        future_tmin_var,
+        date_range,
+        outputs_subdir=outputs_subdir,
+        tmin_v1_legacy_name=False,
+    )
+    if not files:
+        return None
+    frames = [pd.read_parquet(p) for p in files]
+    if not frames:
+        return None
+    df = pd.concat(frames, ignore_index=True).rename(columns={"Value": "TMIN"})
+    if df.empty or "ID" not in df.columns or "FECHA" not in df.columns:
+        return None
+    df["FECHA"] = pd.to_datetime(df["FECHA"])
+    return df[["ID", "FECHA", "TMIN"]].copy()
+
+
+def shard_future_tmin_by_bucket(
+    *,
+    prediction_years: Tuple[int, int],
+    base_path: PathLike,
+    output_dir: PathLike,
+    future_tmin_var: str = "tmin",
+    outputs_subdir: str = "Outputs",
+    num_buckets: int = 1024,
+    overwrite: bool = False,
+    logger: Optional[logging.Logger] = None,
+) -> BucketedForecastTminResult:
+    """
+    Shard forecast-horizon TMIN into ``output_dir/id_bucket=XXXX/future_tmin_YYYY.parquet``.
+
+    Mirrors ``build_bucketed_training_dataset`` but for the single exogenous future-TMIN
+    variable over the prediction horizon, so the bucketed forecast task can read its
+    exogenous inputs once per bucket instead of once per ID.
+    """
+    log = logger or logging.getLogger(__name__)
+    start_year, end_year = prediction_years
+    if start_year > end_year:
+        raise ValueError(f"Invalid prediction_years={prediction_years}: start_year > end_year")
+    if num_buckets <= 0:
+        raise ValueError("num_buckets must be a positive integer.")
+
+    out_dir = as_path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    years_processed = 0
+    bucket_files_written = 0
+
+    for year in tqdm(range(start_year, end_year + 1), desc="Sharding Future TMIN"):
+        year_marker = out_dir / f".done_{year}"
+        if year_marker.exists() and not overwrite:
+            continue
+
+        temp_year_dir = out_dir / f".tmp_year_{year}"
+        if temp_year_dir.exists():
+            shutil.rmtree(temp_year_dir)
+        temp_year_dir.mkdir(parents=True, exist_ok=True)
+
+        month_starts = pd.date_range(f"{year}-01-01", f"{year}-12-31", freq="MS")
+        for month_start in month_starts:
+            ym = month_start.strftime("%Y_%m")
+            monthly = _read_monthly_future_tmin(
+                base_path=base_path,
+                future_tmin_var=future_tmin_var,
+                outputs_subdir=outputs_subdir,
+                month_start=month_start,
+            )
+            if monthly is None or monthly.empty:
+                continue
+
+            monthly["ID"] = pd.to_numeric(monthly["ID"], errors="coerce").astype("Int64")
+            monthly = monthly.dropna(subset=["ID"]).copy()
+            monthly["ID"] = monthly["ID"].astype(int)
+            monthly["id_bucket"] = monthly["ID"].map(
+                lambda value: bucket_for_id(int(value), num_buckets=num_buckets)
+            )
+
+            for bucket_id, bucket_df in monthly.groupby("id_bucket", sort=True):
+                temp_bucket_dir = bucket_dir(temp_year_dir, int(bucket_id))
+                temp_bucket_dir.mkdir(parents=True, exist_ok=True)
+                temp_file = temp_bucket_dir / f"part_{ym}.parquet"
+                to_write = bucket_df.drop(columns=["id_bucket"]).sort_values(["ID", "FECHA"])
+                to_write.to_parquet(temp_file, engine="pyarrow", index=False)
+
+        bucket_ids_in_year = discover_bucket_ids(temp_year_dir)
+        if not bucket_ids_in_year:
+            shutil.rmtree(temp_year_dir)
+            continue
+
+        for bucket_id in bucket_ids_in_year:
+            bucket_out_dir = bucket_dir(out_dir, int(bucket_id))
+            bucket_out_dir.mkdir(parents=True, exist_ok=True)
+            out_file = bucket_out_dir / f"future_tmin_{year}.parquet"
+            if out_file.exists() and not overwrite:
+                continue
+
+            yearly_bucket_df = read_parquet_any(bucket_dir(temp_year_dir, int(bucket_id)))
+            if "id_bucket" in yearly_bucket_df.columns:
+                yearly_bucket_df = yearly_bucket_df.drop(columns=["id_bucket"])
+            yearly_bucket_df = yearly_bucket_df.sort_values(["ID", "FECHA"]).reset_index(drop=True)
+            yearly_bucket_df.to_parquet(out_file, engine="pyarrow", index=False)
+            bucket_files_written += 1
+
+        shutil.rmtree(temp_year_dir)
+        year_marker.write_text("ok\n", encoding="ascii")
+        years_processed += 1
+
+    log.info(
+        "Sharded future TMIN at %s with %s year(s) and %s file(s).",
+        out_dir, years_processed, bucket_files_written,
+    )
+    return BucketedForecastTminResult(
+        output_dir=out_dir,
+        year_range=prediction_years,
+        num_buckets=num_buckets,
+        years_processed=years_processed,
+        bucket_files_written=bucket_files_written,
+    )

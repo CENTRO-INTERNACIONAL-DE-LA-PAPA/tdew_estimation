@@ -5,7 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "dask>=2025.12.0",
+    "dask[distributed]>=2025.12.0",
     "geopandas>=1.1.1",
     "numpy>=2.3.5",
     "pandas>=2.3.3",
@@ -13,4 +13,11 @@ dependencies = [
     "rasterio>=1.4.4",
     "statsmodels>=0.14.6",
     "tqdm>=4.67.1",
+]
+
+[project.optional-dependencies]
+# Multi-node CPU scaling on SLURM. GPU/RAPIDS deps are Linux+CUDA only and live in
+# HPC_code/requirements-gpu.txt (installed from the NVIDIA PyPI index).
+hpc = [
+    "dask-jobqueue>=0.8.5",
 ]

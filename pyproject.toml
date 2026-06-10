@@ -14,3 +14,10 @@ dependencies = [
     "statsmodels>=0.14.6",
     "tqdm>=4.67.1",
 ]
+
+[project.optional-dependencies]
+# Multi-node CPU scaling on SLURM. GPU/RAPIDS deps are Linux+CUDA only and live in
+# HPC_code/requirements-gpu.txt (installed from the NVIDIA PyPI index).
+hpc = [
+    "dask-jobqueue>=0.8.5",
+]

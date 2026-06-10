@@ -35,18 +35,44 @@ $$
 For each spatial `ID` and each day-of-year `doy`, the model fits a weighted
 linear regression using `TMIN` anomaly and lagged anomaly variables.
 
+**Why anomalies, in plain terms.** Raw temperature has a strong, predictable
+seasonal cycle: every location is warmer in summer and colder in winter. If we
+modelled raw `TD` against raw `TMIN`, most of the apparent relationship would just be
+"both follow the seasons" — not the physical link we care about. So we first subtract
+each location's *typical* value for that day of year (its **climatology**), leaving
+the **anomaly**: how far above or below normal today is. The regression then learns
+the genuine day-to-day coupling between dewpoint and minimum temperature, having
+removed the season. We fit a *separate* small regression for each `(ID, doy)` so the
+relationship is allowed to change by location and by time of year, and we borrow
+strength from neighbouring days of the year (a local window of half-width `h`) so each
+fit has enough samples. The end products are: a climatology table, the fitted
+regression coefficients per `(ID, doy)`, and optionally forecast `TD` values.
+
 ## PRAM Model
 
-We use a CREW PRAM interpretation:
+PRAM (Parallel Random Access Machine) is the standard idealized model for reasoning
+about parallel algorithms: many processors share one memory, and we count how the
+work spreads across them. We use the **CREW** ("Concurrent Read, Exclusive Write")
+variant, which matches this pipeline exactly:
 
-- Concurrent read: many processors may read shared input tables.
-- Exclusive write: each processor writes to a disjoint output bucket, ID, or
-  day-of-year result.
-- Reductions, such as sums and means, are treated as parallel reductions.
-- `pardo` means the loop body can be executed in parallel.
+- **Concurrent read**: many processors may read the *same* shared input tables at once
+  (e.g. every worker can read the climatology). Reads do not conflict.
+- **Exclusive write**: no two processors write to the *same* output location. Here that
+  is enforced naturally — each worker owns a disjoint output bucket / ID / day-of-year,
+  so there are never write collisions to coordinate.
+- **Reductions** (sums, means, counts) are treated as parallel reductions: combining
+  `m` values costs about `log m` steps rather than `m`, because the values are added
+  pairwise up a tree.
+- **`pardo`** marks a loop whose iterations are independent and may therefore run in
+  parallel. It is the central annotation in this document: wherever you see `pardo`,
+  there is no dependency between iterations, so a scheduler is free to spread them
+  across all available workers.
 
 The bucket-year design is important because it prevents 300k independent ID
-tasks from repeatedly scanning the same historical parquet files.
+tasks from repeatedly scanning the same historical parquet files. Instead of each
+ID re-opening every monthly file, the data is grouped once into `B` buckets, and each
+worker reads its bucket's compact files a single time — turning a storm of tiny,
+repeated reads into a few large sequential ones.
 
 ## Symbols
 
@@ -67,6 +93,47 @@ tasks from repeatedly scanning the same historical parquet files.
 
 In this project, `D`, `h`, and `F` are small constants in practice, but they are
 shown explicitly in the complexity formulas.
+
+## How to Read the Complexity Formulas
+
+Every algorithm below is described with three kinds of cost. Reading them is easier
+if you keep their plain-language meaning in mind:
+
+- **Work `W` (sequential cost).** The *total* number of basic operations the
+  algorithm performs, regardless of how many processors run it. This is what you
+  would pay on a single processor. It never gets smaller by adding hardware — it is
+  the intrinsic size of the computation.
+- **Parallel time `T_p` (wall-clock with `p` processors).** How long the algorithm
+  takes when `p` workers run in parallel. The recurring shape is
+
+  $$
+  T_p \approx \underbrace{\frac{W}{p_{eff}}}_{\text{work shared out}}
+  + \underbrace{\text{overhead}}_{\text{coordination, I/O, dependencies}} .
+  $$
+
+  The first term is the work divided among the workers (perfect speedup). The second
+  term is what stops speedup from being perfect: combining partial results
+  (a *reduction*, costing about `log` of the number of items), reading and writing
+  files, scheduler bookkeeping, and any step that must wait for an earlier one.
+- **Span `T_∞` (the critical path).** The time even with *unlimited* processors —
+  the length of the longest chain of steps that must happen in order. A small span
+  means the algorithm is "wide" (highly parallel); a large span means something is
+  inherently sequential.
+
+Two notations recur and are worth reading literally:
+
+- A **`+ log(...)`** term is the cost of a parallel **reduction** — e.g. summing many
+  numbers into one by repeated pairwise addition takes about `log` steps. It is small
+  but non-zero, which is why `T_p` never reaches exactly `W/p`.
+- **`min(p, B)`** appears wherever the work is cut into `B` independent **bucket
+  tasks**. You can only run as many buckets at once as you have workers *and* as you
+  have buckets, so the usable parallelism is `min(p, B)`. If `p > B`, the extra
+  workers have no bucket to take and sit idle — the origin of the rule `p_{eff} ≤ B`
+  discussed in the HPC section.
+
+So, in one sentence: **`W` says how big the computation is, `T_p` says how much
+wall-clock time the cluster can buy back, and the overhead terms say why that
+speedup eventually stops.**
 
 ## Algorithm 1: Full TDEW Pipeline
 
@@ -116,6 +183,17 @@ Output:
 15 return coefficients, predictions
 ```
 
+**Reading the pipeline.** The flow is: first learn each location's seasonal normals
+(**climatology**, line 1); reshape the raw monthly files into compact per-bucket files
+so later stages read efficiently (**build bucket-year dataset** and **shard
+climatology**, lines 2–3); fit the local regressions that are the scientific output
+(**train coefficients**, line 4); then a quality-control loop (lines 5–10) that checks
+whether every day of year was successfully fitted for every location and, if not,
+retrains *only* the missing days and patches them in; and finally an optional
+**forecast** (lines 11–14) that rolls the fitted model forward over a future horizon.
+Steps run in sequence, but each step is internally parallel (its `pardo` loops). The
+later algorithms expand each of these lines.
+
 ## Algorithm 2: Build Climatology
 
 The climatology is the historical mean for each `(ID, doy)`.
@@ -162,6 +240,14 @@ Space:
 $$
 S_{clim} = O(ND)
 $$
+
+**What the costs mean.** The work `O(R)` says we touch every row of every climate
+variable exactly once — there is no way to compute averages without looking at all the
+data, so this is as cheap as it can be. The parallel time `O(R/p + log R)` says the
+row-touching splits perfectly across `p` workers (`R/p`), plus a small `log R` tail for
+combining the per-key partial sums into final means (the reduction). The output is one
+number per `(ID, doy)` pair, hence memory `O(ND)` — far smaller than the raw input,
+because 40 years of daily values collapse into a single seasonal curve per location.
 
 ## Algorithm 3: Build Bucket-Year Training Dataset
 
@@ -233,6 +319,21 @@ $$
 S_{bucket-year} = O\left(\frac{ND}{B}\right)
 $$
 
+**The idea in one picture.** A *bucket* is just a deterministic group of IDs:
+`bucket = ID mod B`. We pay the expensive TD↔TMIN merge once, then file every row into
+its bucket (and year). Afterwards, any stage that needs an ID's data reads one small,
+already-merged, already-sorted file instead of re-scanning the whole archive.
+
+**Reading the formulas.** The work `O(R)` again says we pass over every row once. The
+`log(ND/B)` factor that appears when sorting is included is the cost of ordering the
+rows *inside* each bucket-year shard; because each shard holds only about `ND/B` rows
+(not all `R`), that log is of a small quantity, so sorting adds very little. The
+parallel time has the same `R/p` work-sharing plus that small `log(ND/B)` reduction.
+Crucially, peak memory is `O(ND/B)`, **not** `O(R)`: a worker only ever holds one
+bucket-year shard at a time, so increasing `B` *lowers* the memory each worker needs.
+That is the lever that keeps 300k IDs × 40 years from ever having to fit in one
+machine's RAM.
+
 ## Algorithm 4: Shard Climatology by Bucket
 
 ```{.text .numberLines}
@@ -271,6 +372,13 @@ S_{clim-shard} = O(ND / B)
 $$
 
 If the full climatology is loaded at once, peak memory becomes `O(ND)`.
+
+**Why this step exists.** Sharding does no arithmetic — it only *moves* each
+climatology row to the bucket its ID belongs to, so that the training stage finds an
+ID's normals in the same bucket as its training rows and reads both with one pass. The
+cost is therefore a single streaming pass (`O(ND)` work) plus a `log B` term for
+routing rows to `B` destinations; streaming keeps only one bucket's worth (`O(ND/B)`)
+in memory at a time.
 
 ## Algorithm 4b: Shard Future TMIN by Bucket
 
@@ -319,10 +427,28 @@ $$
 S_{fut-shard} = O(NH / B)
 $$
 
+**In short.** This is the same routing step as Algorithm 4, but applied to the future
+`TMIN` that drives the forecast, and only over the `H` forecast days rather than the
+full history. Laying it out by the *same* buckets means each forecast task later reads
+its coefficients, climatology, history, and future `TMIN` all from one bucket, once.
+
 ## Algorithm 5: Train Anomaly Coefficients
 
 For each `ID` and each target `doy`, fit a weighted regression over a circular
 day-of-year neighborhood.
+
+**What one fit actually does.** Suppose we want the model for location `i` on
+day-of-year `d` (say day 60). We do not use only day-60 data — a single day across 40
+years is too few points. Instead we gather every observation whose day-of-year lies
+within `h` days of `d` (the *local window*), wrapping around the year end so that
+day 365 is a neighbour of day 1 (*circular* distance). Points nearer to day `d` get
+more influence through a **tricube weight** that smoothly falls to zero at the window
+edge, so the fit reflects "around day 60" while still being centred on day 60. On that
+weighted neighbourhood we solve a small weighted least-squares regression of the `TD`
+anomaly on the `TMIN` anomaly and a few lagged anomalies. The result — the regression
+coefficients — is stored for `(i, d)`. We repeat this for every day of year and every
+location, which is why the total count of fits is enormous even though each one is
+tiny.
 
 ```{.text .numberLines}
 Algorithm TRAIN-COEFFICIENTS
@@ -380,17 +506,37 @@ $$
 W_{one-fit} = O(W) = O(Yh)
 $$
 
+**Where `O(WF² + F³)` comes from.** Solving a weighted least-squares fit means
+forming the `F × F` normal-equations matrix `XᵀWX` from `W` weighted sample rows
+(that is the `WF²` term — each of `F²` matrix entries sums over `W` rows) and then
+solving the resulting `F × F` linear system (the `F³` term, the cost of a small
+matrix factorization). Because the feature count `F = 5` is a fixed constant here,
+both terms collapse to a constant times `W`, so **one fit costs `O(W) = O(Yh)`** —
+proportional to how many neighbourhood samples it sees.
+
 All coefficient training:
 
 $$
 W_{train} = O(NDW) = O(NDYh)
 $$
 
+That is simply *one fit* (`O(Yh)`) times the *number of fits* (`N` locations × `D`
+days of year). With `N ≈ 3×10⁵` and `D ≈ 366`, that is roughly `1.1×10⁸` independent
+fits — this product is the pipeline's dominant cost and the main target of the scaling
+experiments.
+
 Ideal PRAM span if buckets, IDs, and DOYs are fully parallel:
 
 $$
 T_\infty = O(\log W + F^3)
 $$
+
+**Reading the span.** If we had unlimited processors, all `1.1×10⁸` fits could run at
+once, so the only time left is *one* fit's critical path: a `log W` reduction to sum
+the neighbourhood into the normal equations, plus the constant `F³` solve. In other
+words the algorithm is extremely "wide" — almost nothing is inherently sequential
+inside training. The reason real runs are far slower than `T_∞` is purely that we have
+`p` workers, not infinitely many, and that data must be read from disk.
 
 With `p` processors:
 
@@ -403,6 +549,37 @@ Practical bucket-parallel execution has at most `B` outer tasks, so:
 $$
 T_p = O\left(\frac{NDYh}{\min(p, B)} + \text{I/O overhead}\right)
 $$
+
+**Why `min(p, B)` and not `p` — and what this means for a GPU.** In the
+implementation the unit of parallel scheduling is the **bucket**: one bucket is one
+task handed to one worker. So the number of buckets running *at the same time* can be
+no larger than the number of workers `p` and no larger than the number of buckets `B`
+— hence `min(p, B)`. This is **bucket-level** (outer) parallelism, and it is the only
+thing `min(p, B)` bounds.
+
+There is a second, independent level of parallelism *inside* each bucket task: the
+`≈ (N/B)·D` individual `5×5` fits in that bucket are mutually independent. How that
+inner level is exploited is exactly what differs between CPU and GPU:
+
+- **CPU.** Each worker is a single-threaded process (BLAS pinned to one thread), so it
+  works through its bucket's fits one at a time. The inner level is *not* parallelized
+  per worker; speedup comes entirely from running more buckets at once. Here `p` =
+  number of worker processes (≈ cores), and you want **many** buckets (`B ≥ 4p`) so no
+  core goes idle.
+- **GPU (A100).** Each GPU is one worker, so at the bucket level `p` = number of GPUs
+  (often just 1–8) and `min(p, B)` is small. But a GPU does not process a bucket's fits
+  one at a time: it assembles the `XᵀWX` normal equations for *all* `≈ (N/B)·D ≈ 10⁵`
+  fits in the bucket and solves them in a single **batched** call, spreading them
+  across thousands of CUDA cores. That inner batch width — on the order of `10⁵` fits
+  offered to the device per wave, cleared in milliseconds — is where the GPU's speed
+  comes from, and **`min(p, B)` does not bound it**. The practical implication reverses
+  the CPU rule: a GPU wants buckets *large enough* that each batch fills the device, so
+  one does not push `B` very high for GPU runs.
+
+In both cases the *total* work `O(NDYh)` is identical; the hardware only changes how
+the two levels of parallelism are filled. The "Hardware is just more processors"
+section below makes this precise, and the scaling experiments measure which hardware
+clears the `1.1×10⁸` fits fastest.
 
 Peak memory per bucket task:
 
@@ -453,7 +630,12 @@ $$
 S_{check} = O(C)
 $$
 
-The output itself is small: at most `D` incomplete DOYs.
+**What it checks.** A `(ID, doy)` fit can be skipped if its neighbourhood had too few
+valid samples (line 19 of training). This step is a sanity audit: for each day of
+year, count how many locations actually got a coefficient and compare to how many the
+grid says should exist. Any day of year missing some locations is flagged for repair.
+It is a cheap single pass over the coefficient table (`O(C)`), and its output is tiny —
+a short list of at most `D` days to redo.
 
 ## Algorithm 7: Repair Failed DOYs
 
@@ -495,7 +677,11 @@ $$
 T_p = O(NQYh / p + \log(Yh))
 $$
 
-If `Q << D`, repair is much faster than full training.
+**Why repair is cheap.** Repair is structurally identical to training (same buckets,
+same weighted fits) but restricted to the `Q` flagged days instead of all `D`. So its
+cost is the training cost with `D` replaced by `Q`: `O(NQYh)`. When only a handful of
+days failed (`Q ≪ D`), this is a tiny fraction of a full retrain — we redo the few
+broken days, not all 366.
 
 ## Algorithm 8: Patch Coefficients
 
@@ -536,6 +722,13 @@ Peak memory per bucket:
 $$
 S_{patch-bucket} = O(ND / B + NQ / B)
 $$
+
+**What patching does.** Rather than editing the big coefficient table in place, each
+bucket rebuilds itself: keep the rows whose day of year was *not* repaired, add the
+freshly repaired rows, and drop any duplicate `(ID, doy)` in favour of the repair.
+This is pure bookkeeping — a read, a filter, a union, a sort, a write per bucket — so
+its cost is just proportional to the table size plus the small patch, with no new
+model fitting.
 
 ## Algorithm 9: Optional Forecasting (bucketed)
 
@@ -594,9 +787,17 @@ $$
 T_p = O\left(\frac{NH}{\min(p, B)} + H\right)
 $$
 
-The `+ H` term remains because the forecast for one ID is recursive over time.
-As with training, the bucket structure bounds the effective parallelism by
-`p_{eff} \leq B`.
+**Why forecasting has a `+ H` that training does not.** Training fits are mutually
+independent, so they parallelize completely. Forecasting is different *within* one
+location: to predict day `t` we feed in the *predicted* anomaly from day `t-1` (the
+lag features). Day 2 needs day 1, day 3 needs day 2, and so on, so the `H` forecast
+days for a single ID must be computed *in order* — they cannot be split across
+workers. That unavoidable chain of length `H` is the `+ H` term. We still parallelize
+fully across the millions of *locations* (and across buckets), so the work `O(NH)`
+divides by `min(p, B)`; only the per-ID time-stepping stays sequential. As with
+training, the bucket structure bounds the effective parallelism by `p_{eff} \leq B`,
+and on a GPU the same two-level picture applies — many IDs' recursions advance one
+time-step together as a batched operation across CUDA cores.
 
 Peak memory per bucket task:
 
@@ -649,6 +850,14 @@ regressions, but it removes the repeated source-file scanning that made the
 previous implementation slow and fragile.
 
 ## Summary Complexity Table
+
+The table collects the three costs for every phase. Read each row as: *"this is how
+big the phase is (`W`), how its wall-clock time shrinks with `p` workers (`T_p`), and
+how much memory one worker needs."* The phases with `min(p, B)` in their `T_p`
+(train, repair, forecast) are the bucket-parallel compute stages whose speedup
+saturates once `p` reaches `B`; the others (`/p` only) are I/O-bound passes that scale
+with workers until the filesystem becomes the limit. The single dominant entry is
+**train coefficients**, `O(NDYh)`.
 
 | Phase | Sequential work | Ideal parallel time with `p` processors | Peak memory target |
 |---|---:|---:|---:|
@@ -753,6 +962,14 @@ O\left(
 + \log(NYD)
 \right)
 $$
+
+Term by term, that parallel time reads as: build the bucket-year dataset
+(`NYD log(ND/B) / p`), do the full training (`NDYh / min(p,B)`, the big one), repair
+the failed days if any (`NQYh / min(p,B)`), run the forecast (`NH / min(p,B)`), pay
+the unavoidable per-ID forecast recursion (`+ H`), and pay one global reduction
+(`+ log(NYD)`). The preprocessing terms divide by `p` (they are limited by the
+filesystem, not buckets), while the three compute stages divide by `min(p, B)` (they
+are limited by the bucket count).
 
 The `+ H` term remains because forecasting is recursive over time for each ID.
 If forecasting is not executed, remove `NH/min(p,B) + H`. If no failed DOYs
@@ -867,10 +1084,30 @@ well to:
   `(X^\top W X)\beta = X^\top W y` for many `(ID, doy)` pairs and solving them in a
   single batched call.
 
-So a GPU is, in PRAM terms, simply a source of a larger `p` (with a different
-constant `c`). Which of CPU or GPU yields the smaller `c \cdot T_p` for this
-workload is an empirical question, answered by the scaling experiments below, not
-by the complexity model.
+**Two levels of parallelism — and which one a GPU fills.** It is worth being precise
+about what "more processors" means here, because the two hardwares add parallelism at
+different levels:
+
+- *Outer (bucket) level* — how many buckets run at once. This is what `min(p, B)`
+  bounds. On CPU, `p` is the number of worker processes (≈ cores); on GPU, `p` is the
+  number of **GPUs** (one `dask-cuda` worker per device), often just 1–8.
+- *Inner (fit) level* — how many of a bucket's `≈ (N/B)\,D ≈ 10^5` independent fits are
+  evaluated together. On CPU this is `1` (each worker fits one at a time, BLAS pinned).
+  On GPU this is the **batch width**: the device factors `10^5` stacked `5\times5`
+  systems at once. `min(p, B)` does **not** bound this level.
+
+Concretely, a single A100 (108 SMs, up to ~2048 resident threads each, so
+`\approx 2.2\times10^5` threads in flight) is offered a whole bucket's `\approx 10^5`
+fits per wave and clears them in milliseconds. So one A100 gives `p = 1` at the bucket
+level but `\sim 10^5` fit-lanes per wave — the speed lives at the inner level. This
+also reverses the bucket-count guidance: CPU wants **many** buckets (`B \geq 4p`) to
+keep cores busy, whereas GPU wants buckets **large enough** that each batch fills the
+device, so `B` is not pushed high for GPU runs.
+
+So a GPU is, in PRAM terms, simply a source of a larger *effective* `p` (with a
+different constant `c`): a modest outer `p` multiplied by a very large inner batch.
+Which of CPU or GPU yields the smaller `c \cdot T_p` for this workload is an empirical
+question, answered by the scaling experiments below, not by the complexity model.
 
 The remaining, hardware-independent, speedups still come from:
 
@@ -900,11 +1137,15 @@ $$
 \text{Efficiency: } E(p) = \frac{S(p)}{p}
 $$
 
-`S(p)` is ideally linear (`S(p) = p`) and `E(p)` is ideally `1`. The PRAM analysis
-predicts the departure from ideal: because the training and forecast stages are
-bucket-parallel with `p_{eff} \leq B`, efficiency stays high while `p \leq B` and
-then degrades; I/O bandwidth, scheduler overhead, and the sequential pipeline
-dependencies set the practical ceiling.
+In plain terms: **speedup** answers "how many times faster did `p` workers make it?"
+and **efficiency** answers "what fraction of those workers' time was actually useful?"
+Ideal speedup is `S(p) = p` (8 workers → 8× faster) and ideal efficiency is `E(p) = 1`
+(100% of every worker busy). Real efficiency drops below 1 because some work is
+sequential or workers wait on each other or on the disk. `S(p)` is ideally linear and
+`E(p)` is ideally `1`. The PRAM analysis predicts the departure from ideal: because
+the training and forecast stages are bucket-parallel with `p_{eff} \leq B`, efficiency
+stays high while `p \leq B` and then degrades; I/O bandwidth, scheduler overhead, and
+the sequential pipeline dependencies set the practical ceiling.
 
 ### Definition of a "processor" `p`
 
@@ -936,6 +1177,13 @@ To make the measurements reproducible and fair:
   separately because the I/O-bound preprocessing phases are cache sensitive.
 - Only the phase under test is timed (with `time.perf_counter` around the driver
   call); inputs from earlier phases are precomputed once and reused.
+
+The two scaling studies below ask two different questions. **Strong scaling** fixes
+the problem and adds workers — "can the cluster make *this* job finish sooner?"
+**Weak scaling** grows the problem in step with the workers — "if we double both the
+data and the machines, does the time stay flat?" Strong scaling exposes the
+`p_{eff} \leq B` ceiling; weak scaling isolates the overhead that grows with the number
+of workers.
 
 ### Strong scaling (fixed problem, more processors)
 

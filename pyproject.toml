@@ -5,6 +5,8 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "dask-cuda>=0.18.0",
+    "dask-jobqueue>=0.9.0",
     "dask[distributed]>=2025.12.0",
     "geopandas>=1.1.1",
     "numpy>=2.3.5",
@@ -21,3 +23,6 @@ dependencies = [
 hpc = [
     "dask-jobqueue>=0.8.5",
 ]
+
+[tool.ty.environment]
+python = ".venv"

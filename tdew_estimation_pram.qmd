@@ -104,8 +104,16 @@ Output:
                                           incomplete_doys)
 9      incomplete_doys <- CHECK-COMPLETENESS(coefficients, Grid)
 10 end if
-11 predictions <- optional FORECAST-TD(coefficients, climatology, TMIN future)
-12 return coefficients, predictions
+11 if forecasting is requested then
+12     bucketed_future_tmin <- SHARD-FUTURE-TMIN(TMIN future, B)
+13     predictions <- FORECAST-TD(coefficients,
+                                  bucketed_climatology,
+                                  bucketed_training,
+                                  bucketed_future_tmin,
+                                  H,
+                                  B)
+14 end if
+15 return coefficients, predictions
 ```
 
 ## Algorithm 2: Build Climatology
@@ -263,6 +271,53 @@ S_{clim-shard} = O(ND / B)
 $$
 
 If the full climatology is loaded at once, peak memory becomes `O(ND)`.
+
+## Algorithm 4b: Shard Future TMIN by Bucket
+
+Forecasting needs the exogenous future `TMIN` over the prediction horizon laid
+out by the same buckets as the coefficients, so that each forecast task reads its
+inputs once. This mirrors the bucket-year preprocessing of Algorithm 3, but for a
+single variable and only over the forecast horizon.
+
+Let `R_fut = N * H` be the number of future TMIN rows over the horizon `H`.
+
+```{.text .numberLines}
+Algorithm SHARD-FUTURE-TMIN-BY-BUCKET
+Input:
+  future TMIN monthly files over the forecast horizon
+  Number of buckets B
+
+Output:
+  bucketed future-TMIN files: bucket b -> rows (ID, date, TMIN)
+
+1  for each month m in the horizon pardo do
+2      read future TMIN rows for month m
+3      for each row r pardo do
+4          r.bucket <- r.ID mod B
+5          emit r to temporary partition (bucket = r.bucket)
+6      end for
+7  end for
+8  for each bucket b in 0..B-1 pardo do
+9      write compact future-TMIN file for bucket b
+10 end for
+11 return bucketed future TMIN
+```
+
+Complexity:
+
+$$
+W_{fut-shard} = O(R_{fut}) = O(NH)
+$$
+
+$$
+T_p = O(NH / p + \log B)
+$$
+
+Peak memory with streaming:
+
+$$
+S_{fut-shard} = O(NH / B)
+$$
 
 ## Algorithm 5: Train Anomaly Coefficients
 
@@ -482,36 +537,48 @@ $$
 S_{patch-bucket} = O(ND / B + NQ / B)
 $$
 
-## Algorithm 9: Optional Forecasting
+## Algorithm 9: Optional Forecasting (bucketed)
 
-Forecasting is parallel across IDs, but recursive through time for each ID.
-That means the horizon loop cannot be fully parallelized within one ID because
-day `t` depends on previous lagged anomaly values.
+Forecasting is parallel across buckets, and across IDs within a bucket, but
+recursive through time for each ID: day `t` depends on the previously predicted
+TD anomaly, so the horizon loop cannot be parallelized within one ID. Like
+training, the work is organized by bucket so that each coefficient, climatology,
+history, and future-TMIN shard is read exactly once. The future-TMIN shards are
+produced by Algorithm 4b; the history (used only to seed the first two lags) is
+read from the bucket-year training dataset.
 
 ```{.text .numberLines}
 Algorithm FORECAST-TD
 Input:
-  coefficients per (ID, doy)
-  climatology per (ID, doy)
-  future TMIN values
+  bucketed coefficients per (ID, doy)
+  bucketed climatology per (ID, doy)
+  bucketed history (to seed lags) and bucketed future TMIN
   forecast horizon H
+  Number of buckets B
 
 Output:
   predicted TD for each (ID, date)
 
-1  for each ID i pardo do
-2      initialize lagged TD/TMIN anomalies from observed history
-3      for forecast day t from 1 to H do
-4          d <- day_of_year(date_t)
-5          beta <- coefficients(i, d)
-6          x <- current TMIN anomaly and lagged anomaly features
-7          TD_anom_hat <- beta dot x
-8          TD_hat <- TD_clim(i, d) + TD_anom_hat
-9          update lagged anomalies with TD_anom_hat and TMIN_anom(t)
-10         write prediction (ID i, date_t, TD_hat)
-11     end for
-12 end for
-13 return predictions
+1  for each bucket b in 0..B-1 pardo do
+2      coeff_b <- read coefficient rows for bucket b
+3      clim_b  <- read climatology rows for bucket b
+4      hist_b  <- read history rows for bucket b
+5      ftmin_b <- read future TMIN rows for bucket b
+6      for each ID i in bucket b pardo do
+7          initialize lagged TD/TMIN anomalies from hist_b(i)
+8          for forecast day t from 1 to H do          // sequential in t
+9              d <- day_of_year(date_t)
+10             beta <- coeff_b(i, d)
+11             x <- current TMIN anomaly and lagged anomaly features
+12             TD_anom_hat <- beta dot x
+13             TD_hat <- clim_b(i, d) + TD_anom_hat
+14             update lagged anomalies with TD_anom_hat and TMIN_anom(t)
+15             write prediction (ID i, date_t, TD_hat)
+16         end for
+17     end for
+18     write prediction file for bucket b
+19 end for
+20 return predictions
 ```
 
 Complexity:
@@ -520,13 +587,22 @@ $$
 W_{forecast} = O(NH)
 $$
 
-Parallel time:
+Practical bucket-parallel time (at most `B` outer tasks, recursive over the
+horizon within each ID):
 
 $$
-T_p = O(NH / p + H)
+T_p = O\left(\frac{NH}{\min(p, B)} + H\right)
 $$
 
 The `+ H` term remains because the forecast for one ID is recursive over time.
+As with training, the bucket structure bounds the effective parallelism by
+`p_{eff} \leq B`.
+
+Peak memory per bucket task:
+
+$$
+S_{forecast-bucket} = O\left(\frac{NH}{B} + \frac{ND}{B}\right)
+$$
 
 ## Old Design vs Bucket-Year Design
 
@@ -579,11 +655,12 @@ previous implementation slow and fragile.
 | Build climatology | `O(R)` | `O(R/p + log R)` | `O(ND)` output |
 | Build bucket-year dataset | `O(R)` or `O(R log(ND/B))` with sorting | `O(R/p + log(ND/B))` | `O(ND/B)` per compaction |
 | Shard climatology | `O(ND)` | `O(ND/p + log B)` | `O(ND/B)` streaming |
-| Train coefficients | `O(NDYh)` | `O(NDYh/p + log(Yh))` | `O(NT/B + ND/B)` per bucket |
+| Shard future TMIN | `O(NH)` | `O(NH/p + log B)` | `O(NH/B)` streaming |
+| Train coefficients | `O(NDYh)` | `O(NDYh/min(p,B) + log(Yh))` | `O(NT/B + ND/B)` per bucket |
 | Check completeness | `O(ND)` | `O(ND/p + log(ND))` | `O(ND)` or bucket streaming |
-| Repair `Q` failed DOYs | `O(NQYh)` | `O(NQYh/p + log(Yh))` | same as training bucket |
+| Repair `Q` failed DOYs | `O(NQYh)` | `O(NQYh/min(p,B) + log(Yh))` | same as training bucket |
 | Patch coefficients | `O(ND + NQ)` | `O((ND + NQ)/p)` | `O(ND/B + NQ/B)` per bucket |
-| Forecast horizon `H` | `O(NH)` | `O(NH/p + H)` | `O(NH/B)` per output bucket |
+| Forecast horizon `H` | `O(NH)` | `O(NH/min(p,B) + H)` | `O(NH/B)` per output bucket |
 
 ## Overall Complexity
 
@@ -671,15 +748,15 @@ O\left(
 \frac{NYD\log(ND/B)}{p}
 + \frac{NDYh}{\min(p,B)}
 + \frac{NQYh}{\min(p,B)}
-+ \frac{NH}{p}
++ \frac{NH}{\min(p,B)}
 + H
 + \log(NYD)
 \right)
 $$
 
 The `+ H` term remains because forecasting is recursive over time for each ID.
-If forecasting is not executed, remove `NH/p + H`. If no failed DOYs exist,
-remove the `NQYh / min(p,B)` term.
+If forecasting is not executed, remove `NH/min(p,B) + H`. If no failed DOYs
+exist, remove the `NQYh / min(p,B)` term.
 
 For this project, the practical bottleneck after the bucket-year redesign is:
 
@@ -767,12 +844,161 @@ to keep the bucket count much larger than the number of workers. For example,
 `B = 1024` gives roughly `N/B approx 293` IDs per bucket, which keeps each
 bucket task large enough to amortize overhead but small enough to fit in memory.
 
-The GPU is not expected to help much in the current design because the main
-computation is many small weighted least squares fits plus parquet I/O. The
-largest speedups should come from:
+### Hardware is just more processors
 
-- avoiding repeated parquet scans,
+The complexity above is hardware-agnostic: the total work `W = O(NDYh)` is the
+same whether the pipeline runs on CPU cores or on a GPU. Hardware changes only
+two things: the number of parallel processors `p` it exposes, and the constant
+factor `c` of a single local fit. The parallel runtime is always
+
+$$
+T_p = c \cdot \frac{W}{p_{eff}} + \text{overhead}.
+$$
+
+The per-`(ID, doy)` weighted least squares is embarrassingly parallel: there are
+about `N * D` (roughly `1.1 \times 10^8`) independent fits, each a small `F = 5`
+feature weighted regression over `W = O(Yh)` neighborhood rows. This maps equally
+well to:
+
+- **CPU**: many single-threaded bucket worker processes (one per core), where the
+  bucket structure bounds `p_{eff} \leq B`; or
+- **GPU**: a device that evaluates thousands of these tiny fits concurrently once
+  they are batched, by assembling the `F \times F` weighted normal equations
+  `(X^\top W X)\beta = X^\top W y` for many `(ID, doy)` pairs and solving them in a
+  single batched call.
+
+So a GPU is, in PRAM terms, simply a source of a larger `p` (with a different
+constant `c`). Which of CPU or GPU yields the smaller `c \cdot T_p` for this
+workload is an empirical question, answered by the scaling experiments below, not
+by the complexity model.
+
+The remaining, hardware-independent, speedups still come from:
+
+- avoiding repeated parquet scans (the bucket-year redesign),
 - using bucket-year files,
 - keeping worker memory bounded,
 - parallelizing by bucket,
 - and repairing only failed DOYs instead of repeating all training.
+
+## Experimental Methodology
+
+This section defines how the implementation is evaluated on the university HPC.
+The goal is to measure, as a function of the number of processors `p`, three
+standard parallel-performance quantities, and to do so on both CPU and GPU
+hardware and on both dataset versions.
+
+### Quantities measured
+
+For a fixed problem size, let `T(p)` be the wall-clock time of a phase (or of the
+end-to-end pipeline) using `p` processors. We report:
+
+$$
+\text{Execution time: } T(p)
+\qquad
+\text{Speedup: } S(p) = \frac{T(1)}{T(p)}
+\qquad
+\text{Efficiency: } E(p) = \frac{S(p)}{p}
+$$
+
+`S(p)` is ideally linear (`S(p) = p`) and `E(p)` is ideally `1`. The PRAM analysis
+predicts the departure from ideal: because the training and forecast stages are
+bucket-parallel with `p_{eff} \leq B`, efficiency stays high while `p \leq B` and
+then degrades; I/O bandwidth, scheduler overhead, and the sequential pipeline
+dependencies set the practical ceiling.
+
+### Definition of a "processor" `p`
+
+To compare CPU and GPU on one axis, `p` counts independent worker slots:
+
+| Hardware | One processor (`p` unit) | How `p` is varied |
+|---|---|---|
+| CPU (SLURM) | one single-threaded Dask worker process (one core, BLAS pinned to 1 thread) | `dask_jobqueue.SLURMCluster` scaled to `p` workers |
+| GPU (A100) | one A100 GPU (one `dask-cuda` worker) | `p` = number of A100s in the allocation |
+
+Within a single GPU, the batched weighted-least-squares solver uses all CUDA cores;
+that intra-device parallelism is held fixed and absorbed into the constant `c`, so
+the reported `p` axis is the number of GPUs. This keeps `S(p)` and `E(p)` meaningful
+across hardware: both answer "how much faster with `p` independent workers".
+
+### Controls
+
+To make the measurements reproducible and fair:
+
+- **Baseline `T(1)`** is a single worker with `threads_per_worker = 1` and BLAS
+  thread pools pinned to 1 (`OMP_NUM_THREADS=1`, etc.), as in `run_pipeline.sh`.
+- **Bucket count** is held at `B \geq 4\,p_{max}` for the whole sweep so the bucket
+  granularity is never the limiting factor before `p` reaches its maximum.
+- **Repeated trials**: each `(p, n)` point is run `k` times (e.g. `k = 3`) and the
+  median wall-clock is reported, to suppress filesystem and scheduler jitter.
+- **Storage**: worker scratch / spill goes to node-local fast storage
+  (`local_directory = $TMPDIR`); input parquet lives on the shared filesystem.
+- **Warm vs cold cache** is recorded; cold-cache (first-touch) runs are reported
+  separately because the I/O-bound preprocessing phases are cache sensitive.
+- Only the phase under test is timed (with `time.perf_counter` around the driver
+  call); inputs from earlier phases are precomputed once and reused.
+
+### Strong scaling (fixed problem, more processors)
+
+Hold the problem size fixed at the full grid (or a fixed representative subset of
+`N` IDs) and vary `p`:
+
+$$
+p \in \{1, 2, 4, 8, 16, 32, \dots\} \text{ (CPU)}
+\qquad
+p \in \{1, 2, 4, 8\} \text{ (A100 GPUs)}
+$$
+
+For each `p` we record `T(p)` for the dominant **train-coefficients** phase (and,
+separately, the I/O-bound build-bucket and climatology phases, and optionally
+forecast). From these we compute `S(p)` and `E(p)` and plot all three against `p`.
+The expected curve rises near-linearly while `p \leq B` and the workload is
+compute-bound, then flattens — directly testing the `p_{eff} \leq B` prediction.
+
+### Weak scaling (more processors, proportionally larger problem)
+
+Hold the work per processor constant by scaling the number of trained IDs with `p`:
+
+$$
+n(p) = n_0 \cdot p
+$$
+
+where `n` is the number of IDs trained. The ID subset is selected deterministically
+through the existing `bucket_ids` parameter (each bucket holds `\approx N/B` IDs, so
+choosing `\lceil 4p \rceil` buckets gives a controlled `n(p)`). Weak-scaling
+efficiency is
+
+$$
+E_{weak}(p) = \frac{T(1, n_0)}{T(p, n_0 p)}
+$$
+
+which is ideally `1`. Because the per-`(ID, doy)` fits are independent, the
+compute part of training is expected to weak-scale well; departures isolate I/O and
+scheduling overhead that grow with the number of workers.
+
+### Datasets: PISCOt v1.0 vs v2.0
+
+The full strong- and weak-scaling protocol is run on both dataset versions. The two
+versions are supplied to the same pipeline through the input path / variable-folder
+parameters (`--base`, `--td-var`, `--tmin-var`) writing to separate result roots, so
+no code differs between runs. We compare:
+
+- **Performance**: `T(p)`, `S(p)`, `E(p)` curves for v1.0 vs v2.0 (the work `W`
+  differs only if `N`, `Y`, or data density differ between versions).
+- **Science**: distributions of the fitted coefficients and of the prediction skill,
+  to assess how the dataset version affects the estimated model, independent of
+  runtime.
+
+### Hardware configurations
+
+| Configuration | Cluster | `p` swept |
+|---|---|---|
+| CPU multi-node | `dask_jobqueue.SLURMCluster` (one process per core, `B \geq 4p_{max}`) | worker processes |
+| GPU single/multi-A100 | `dask-cuda` (`LocalCUDACluster` or SLURM `--gres=gpu:a100:p`) | number of A100s |
+
+### Reporting
+
+For each (dataset × hardware) combination we produce: (1) a table of `T(p)`, `S(p)`,
+`E(p)` for the strong-scaling sweep; (2) a table of `E_{weak}(p)`; and (3) three
+plots — execution time vs `p`, speedup vs `p` (with the ideal `S(p)=p` reference),
+and efficiency vs `p`. These quantify both how the implementation scales and which
+hardware minimizes wall-clock time for this workload.

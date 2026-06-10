@@ -1,0 +1,18 @@
+# GPU / HPC extra requirements for the TDEW scaling experiments.
+#
+# Install on top of the base package (`pip install -e .`) in a Linux environment with
+# CUDA 12.x drivers. RAPIDS / dask-cuda are Linux-only and pulled from the NVIDIA PyPI
+# index:
+#
+#   pip install --extra-index-url=https://pypi.nvidia.com -r HPC_code/requirements-gpu.txt
+#
+# SLURM multi-node CPU scaling needs only dask-jobqueue (no CUDA).
+
+# --- SLURM (CPU multi-node) ---
+dask-jobqueue>=0.8.5
+
+# --- GPU (A100) batched-WLS path + dask-cuda cluster (cu12 wheels) ---
+dask-cuda>=24.10
+cupy-cuda12x>=13.0
+cudf-cu12>=24.10
+cuml-cu12>=24.10

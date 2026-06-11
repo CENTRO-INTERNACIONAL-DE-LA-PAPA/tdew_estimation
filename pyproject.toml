@@ -23,6 +23,10 @@ dependencies = [
 hpc = [
     "dask-jobqueue>=0.8.5",
 ]
+# D4 scaling-benchmark analysis/plots (matplotlib only; CPU, no RAPIDS).
+benchmark = [
+    "matplotlib>=3.8",
+]
 
 [tool.ty.environment]
 python = ".venv"

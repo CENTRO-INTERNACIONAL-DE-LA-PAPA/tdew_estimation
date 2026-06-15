@@ -44,15 +44,20 @@ bash HPC_code/sbatch/download_data.sh                 # BASE/VARS/PERU_POTATO/PU
 PERU_POTATO=0 bash HPC_code/sbatch/download_data.sh
 
 # Safety gate — diff a fresh extraction against existing data before overwriting (no writes):
-python HPC_code/nc_to_point_parquet.py --var tmin --nc-dir <dir-with-one-.nc> \
+python HPC_code/nc_to_point_parquet.py --var tmin_v11 --nc-dir <dir-with-one-.nc> \
     --base "$BASE" --shp "$BASE/PotatoZonning/CENAGRO_OnlyPotatoes_Pisco_Altitude.shp" \
     --peru-potato --verify-against-existing
 ```
 
 `--peru-potato` (default) samples each daily layer at the CENAGRO potato centroids (the
 science subset, `ID` = shapefile feature order); `--no-peru-potato` keeps the full grid
-(`ID` = row-major `(lat,lon)`, plus a `grid_index.parquet`). Source→variable map:
-`tmin`←v1.1 TMIN, `td`←v1.1 TDEW, `tmin_v1`←v1.2 TMIN.
+(`ID` = row-major `(lat,lon)`, plus a `grid_index.parquet`).
+
+Version-explicit folders (the older local `tmin`/`tmin_v1` folders were labeled *opposite*
+to their real PISCOt version — confirmed bit-for-bit against figshare). Source→variable map:
+`tmin_v11`←PISCOt v1.1 TMIN (16372509, 1981–2016), `tmin_v12`←PISCOt v1.2 TMIN (20533715 v2,
+1981–2020), `td`←PISCOt v1.1 TDEW (16305341, 1981–2016). The v11-vs-v12 comparison overlaps
+1981–2016.
 
 ## Prerequisite: bucketed inputs
 

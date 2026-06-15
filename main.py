@@ -90,7 +90,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--base-path",
         required=True,
-        help="Root directory containing variable folders (e.g., td/Outputs, tmin_v1/Outputs).",
+        help="Root directory containing variable folders (e.g., td/Outputs, tmin_v12/Outputs).",
     )
     p.add_argument(
         "--grid-file",
@@ -244,7 +244,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     cfg = AnomalyTrainingConfig(
         base_path=base_path,
         td_var="td",
-        tmin_var="tmin_v1",
+        tmin_var="tmin_v12",
         train_year_range=(args.train_start_year, args.train_end_year),
         h=args.h,
         kernel=args.kernel,

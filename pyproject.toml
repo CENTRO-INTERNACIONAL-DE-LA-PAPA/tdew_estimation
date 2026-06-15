@@ -27,6 +27,11 @@ hpc = [
 benchmark = [
     "matplotlib>=3.8",
 ]
+# .nc -> point-parquet extraction (PISCO download pipeline). dask + geopandas already in core.
+netcdf = [
+    "xarray>=2024.0",
+    "netCDF4>=1.6",
+]
 
 [tool.ty.environment]
 python = ".venv"

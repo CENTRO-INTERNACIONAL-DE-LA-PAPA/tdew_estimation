@@ -277,6 +277,12 @@ def build_parser() -> argparse.ArgumentParser:
         "local GPU (client-agnostic). Forecast always stays on the CPU runner.",
     )
     p.add_argument(
+        "--gpu-block",
+        type=int,
+        default=128,
+        help="CUDA threads-per-block for the GPU kernel (occupancy tuning; default 128).",
+    )
+    p.add_argument(
         "--worker-timeout",
         type=int,
         default=1800,
@@ -344,6 +350,7 @@ def run_phase(
             failure_output_root=roots["failures"],
             overwrite=True,
             client=gpu_client,
+            block=args.gpu_block,
             max_in_flight=args.batch_size,
         )
         return time.perf_counter() - t0

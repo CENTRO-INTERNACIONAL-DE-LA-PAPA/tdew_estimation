@@ -330,10 +330,13 @@ def fit_anomaly_coeffs_for_bucket_gpu(
     *,
     doys: Optional[Sequence[int]] = None,
     backend: str = "rawkernel",
+    block: int = 128,
 ) -> pd.DataFrame:
     """Fit every (ID, doy) in a bucket on the GPU. Returns a coeffs frame (CPU schema).
 
     ``backend`` is ``"rawkernel"`` (production) or ``"reference"`` (array-level oracle).
+    ``block`` is the CUDA threads-per-block for the rawkernel launch (one thread per fit);
+    it tunes occupancy only and must not change results.
     """
     if train_df.empty or clim_df.empty:
         return pd.DataFrame(columns=COEFF_COLUMNS)
@@ -359,7 +362,7 @@ def fit_anomaly_coeffs_for_bucket_gpu(
     if backend == "reference":
         beta, r2 = solve_bucket_reference(A_v, b_v, syy_v)
     elif backend == "rawkernel":
-        beta, r2 = solve_bucket_rawkernel(A_v, b_v, syy_v)
+        beta, r2 = solve_bucket_rawkernel(A_v, b_v, syy_v, block=block)
     else:
         raise ValueError(f"Unknown backend: {backend!r} (use 'rawkernel' or 'reference').")
 
@@ -401,6 +404,7 @@ def _train_anomaly_bucket_task_gpu(
     failure_output_root=None,
     overwrite: bool = False,
     backend: str = "rawkernel",
+    block: int = 128,
 ) -> BucketTrainingSummary:
     """GPU analogue of ``anomaly_dask._train_anomaly_bucket_task`` (same I/O contract)."""
     bucket_training_dir = bucket_dir(prepared_training_root, bucket_id)
@@ -458,7 +462,7 @@ def _train_anomaly_bucket_task_gpu(
     if not train_df.empty and not clim_df.empty:
         try:
             coeffs_df = fit_anomaly_coeffs_for_bucket_gpu(
-                train_df, clim_df, config, doys=doys, backend=backend
+                train_df, clim_df, config, doys=doys, backend=backend, block=block
             )
         except Exception as exc:
             failures.append(
@@ -506,6 +510,7 @@ def run_bucketed_anomaly_training_gpu(
     overwrite: bool = False,
     client: Optional[Any] = None,
     backend: str = "rawkernel",
+    block: int = 128,
     max_in_flight: int = 4,
 ) -> List[BucketTrainingSummary]:
     """Run GPU bucket training across many buckets (client-agnostic).
@@ -550,6 +555,7 @@ def run_bucketed_anomaly_training_gpu(
             failure_output_root=failure_root_p,
             overwrite=overwrite,
             backend=backend,
+            block=block,
         )
 
     summaries: List[BucketTrainingSummary] = []

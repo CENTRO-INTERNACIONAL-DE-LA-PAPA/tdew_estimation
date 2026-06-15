@@ -132,6 +132,13 @@ def build_parser() -> argparse.ArgumentParser:
         "instead of the CPU statsmodels path. Numerically equivalent (float64). Pair with "
         "--cluster cuda for multi-GPU; without it, runs on the single local GPU.",
     )
+    p.add_argument(
+        "--gpu-block",
+        type=int,
+        default=128,
+        help="CUDA threads-per-block for the GPU kernel (occupancy tuning; default 128). "
+        "Only used with --gpu-train; must not change results.",
+    )
 
     # Cluster selection
     p.add_argument("--cluster", choices=["local", "slurm", "cuda"], default="local")
@@ -247,6 +254,7 @@ def main(argv: list[str] | None = None) -> int:
                 failure_output_root=failures_root,
                 overwrite=args.overwrite,
                 client=gpu_client,
+                block=args.gpu_block,
                 max_in_flight=args.batch_size,
             )
         else:

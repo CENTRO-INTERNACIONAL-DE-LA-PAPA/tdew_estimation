@@ -130,6 +130,27 @@ def test_three_way_equivalence(synth_bucket):
     _assert_equiv(cpu, raw, "CPU vs RawKernel")
 
 
+@pytest.mark.parametrize("block", [32, 64, 256, 512])
+def test_block_size_does_not_change_results(block):
+    """Threads-per-block tunes occupancy only. The solve is one thread per fit with no
+    cross-thread reduction, so solving the *same* assembled systems with different launch
+    configs must be bit-identical. (We solve fixed inputs here rather than re-running the
+    full pipeline, whose cp.add.at assembly is itself only reproducible to ~1e-16.)"""
+    rng = np.random.default_rng(0)
+    m = 4000
+    # Build M well-conditioned SPD 5x5 systems: A = R Rᵀ + 5I, b/syy arbitrary.
+    R = rng.standard_normal((m, gpu_train.NF, gpu_train.NF))
+    A = R @ np.transpose(R, (0, 2, 1)) + 5.0 * np.eye(gpu_train.NF)
+    b = rng.standard_normal((m, gpu_train.NF))
+    syy = rng.uniform(1.0, 10.0, size=m)
+    A_g, b_g, syy_g = cp.asarray(A), cp.asarray(b), cp.asarray(syy)
+
+    beta0, r20 = gpu_train.solve_bucket_rawkernel(A_g, b_g, syy_g, block=128)
+    beta1, r21 = gpu_train.solve_bucket_rawkernel(A_g, b_g, syy_g, block=block)
+    assert cp.array_equal(beta0, beta1), f"block={block}: beta differs"
+    assert cp.array_equal(r20, r21), f"block={block}: r2 differs"
+
+
 def test_bucket_task_parquet_parity(synth_bucket, tmp_path):
     cfg = _cfg()
     results, bid = synth_bucket["results"], synth_bucket["bid"]

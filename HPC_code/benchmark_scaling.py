@@ -9,14 +9,19 @@ injecting the live ``Client`` into the *same* runners the production entrypoint 
 appends one row per (phase, trial) to a CSV. The CSV feeds ``analyze_scaling.py``,
 which computes speedup ``S(p)`` / efficiency ``E(p)`` and renders the PRAM tables/plots.
 
-The cluster is selected with ``--cluster {local,slurm}``: ``local`` builds a single-node
-``LocalCluster`` sized to ``p`` (dev box / one fat node), ``slurm`` builds a multi-node
-``dask-jobqueue`` fleet of ``p`` worker processes (the D6 path). For ``slurm`` the harness
-waits for the fleet to come up (``client.wait_for_workers(p)``) before starting the timer,
-so SLURM queue/startup latency is excluded from ``wall_s``.
+The cluster is selected with ``--cluster {local,slurm,cuda}``: ``local`` builds a
+single-node ``LocalCluster`` sized to ``p`` (dev box / one fat node), ``slurm`` builds a
+multi-node ``dask-jobqueue`` fleet of ``p`` worker processes (the D6 CPU path), and
+``cuda`` builds a single-node ``dask-cuda`` cluster of ``p`` GPU workers (the D6 GPU path).
+For ``slurm``/``cuda`` the harness waits for the fleet to come up
+(``client.wait_for_workers(p)``) before starting the timer, so queue/startup latency is
+excluded from ``wall_s``.
 
-CPU-only for now. ``--hw gpu`` is reserved for D6 once the GPU training path (D3,
-``gpu_train.py``) and the conda/RAPIDS env exist; it currently raises a clear error.
+``--hw gpu`` routes the TRAIN phase to the GPU batched-WLS trainer
+(``HPC_code/gpu_train.py``); pair it with ``--cluster cuda`` for real multi-GPU scaling.
+Without ``--cluster cuda`` the GPU trainer runs sequentially on the single local GPU
+(dev-box smoke). Forecast stays on the CPU runner. The ``dask-cuda`` cluster requires a
+RAPIDS env (HPC); the single-GPU path needs only CuPy.
 
 CSV schema (10 columns, appended incrementally so partial runs survive)::
 
@@ -58,7 +63,11 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE.parent))
 
-from hpc import make_local_cpu_cluster, make_slurm_cluster  # noqa: E402
+from hpc import (  # noqa: E402
+    make_local_cpu_cluster,
+    make_local_cuda_cluster,
+    make_slurm_cluster,
+)
 
 from tdew_estimation.anomaly_dask import (  # noqa: E402
     DaskAnomalyConfig,
@@ -112,6 +121,14 @@ def make_bench_client(args: argparse.Namespace, p: int):
             local_directory=args.local_dir,
             log_directory=args.slurm_log_dir,
             interface=args.slurm_interface,
+        )
+    if args.cluster == "cuda":
+        return make_local_cuda_cluster(
+            n_workers=p,
+            cuda_visible_devices=args.cuda_visible_devices,
+            rmm_pool_size=args.rmm_pool_size,
+            device_memory_limit=args.device_memory_limit,
+            local_directory=args.local_dir,
         )
     return make_local_cpu_cluster(
         n_workers=p,
@@ -247,16 +264,35 @@ def build_parser() -> argparse.ArgumentParser:
     # Cluster backend
     p.add_argument(
         "--cluster",
-        choices=["local", "slurm"],
+        choices=["local", "slurm", "cuda"],
         default="local",
-        help="local = single-node LocalCluster sized to p; slurm = dask-jobqueue fleet.",
+        help="local = single-node LocalCluster sized to p; slurm = dask-jobqueue fleet; "
+        "cuda = single-node dask-cuda cluster of p GPU workers (D6 GPU scaling).",
+    )
+    p.add_argument(
+        "--gpu-train",
+        action="store_true",
+        help="Route the TRAIN phase to the GPU batched-WLS trainer. Implied by --hw gpu. "
+        "With --cluster cuda it distributes over p GPUs; otherwise it runs on the single "
+        "local GPU (client-agnostic). Forecast always stays on the CPU runner.",
+    )
+    p.add_argument(
+        "--gpu-block",
+        type=int,
+        default=128,
+        help="CUDA threads-per-block for the GPU kernel (occupancy tuning; default 128).",
     )
     p.add_argument(
         "--worker-timeout",
         type=int,
         default=1800,
-        help="Seconds to wait for the fleet to come up before timing (slurm).",
+        help="Seconds to wait for the fleet to come up before timing (slurm/cuda).",
     )
+
+    # CUDA-specific (used with --cluster cuda)
+    p.add_argument("--rmm-pool-size", default=None, help="Per-GPU RMM pool (e.g. 35GB).")
+    p.add_argument("--device-memory-limit", default=None, help="Per-GPU spill threshold (e.g. 38GB).")
+    p.add_argument("--cuda-visible-devices", default=None, help="Explicit GPU ordinals, e.g. '0,1,2,3'.")
 
     # SLURM-specific (used with --cluster slurm)
     p.add_argument("--slurm-queue", default=None, help="SLURM partition (required for slurm).")
@@ -288,13 +324,37 @@ def run_phase(
     train_cfg: AnomalyTrainingConfig,
     roots: dict[str, Path],
     history_end: int,
+    use_gpu_train: bool = False,
 ) -> float:
     """Time a single phase via the injected-client runner. Returns wall seconds.
 
     The runner reuses the injected ``client``, so ``dask_config`` only tunes the
     sliding-window size (``max(batch_size, n_workers)``); we set ``n_workers=p`` to
     match the live cluster.
+
+    When ``use_gpu_train`` the TRAIN phase runs the GPU batched-WLS trainer instead;
+    it distributes over the cuda ``client`` (``--cluster cuda``), or runs sequentially
+    on the single local GPU (``client=None``) for any other cluster.
     """
+    if phase == "train" and use_gpu_train:
+        from gpu_train import run_bucketed_anomaly_training_gpu  # lazy: needs CuPy
+
+        gpu_client = client if args.cluster == "cuda" else None
+        t0 = time.perf_counter()
+        run_bucketed_anomaly_training_gpu(
+            prepared_training_root=roots["prepared"],
+            bucketed_climatology_root=roots["clim"],
+            coeffs_output_root=roots["coeffs"],
+            config=train_cfg,
+            bucket_ids=bucket_ids,
+            failure_output_root=roots["failures"],
+            overwrite=True,
+            client=gpu_client,
+            block=args.gpu_block,
+            max_in_flight=args.batch_size,
+        )
+        return time.perf_counter() - t0
+
     if phase == "train":
         t0 = time.perf_counter()
         run_bucketed_anomaly_training_dask(
@@ -344,11 +404,13 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = build_parser().parse_args(argv)
 
-    if args.hw == "gpu":
-        raise NotImplementedError(
-            "GPU benchmark rows need D3 (HPC_code/gpu_train.py) + the conda/RAPIDS env "
-            "(roadmap Phase 0). D4 ships CPU-only; run with --hw cpu. The CSV's `hw` "
-            "column already reserves a slot so GPU rows append cleanly in D6."
+    # --hw gpu routes TRAIN to the GPU batched-WLS trainer (D3). --gpu-train forces it
+    # explicitly; either implies GPU training for the train phase below.
+    use_gpu_train = args.gpu_train or args.hw == "gpu"
+    if use_gpu_train and "forecast" in args.phases:
+        log.warning(
+            "GPU training is enabled but the forecast phase stays on the CPU runner "
+            "(GPU forecast is out of scope)."
         )
 
     p_list = _parse_int_list(args.p_list)
@@ -436,6 +498,7 @@ def main(argv: list[str] | None = None) -> int:
                         train_cfg=train_cfg,
                         roots=roots,
                         history_end=history_end,
+                        use_gpu_train=use_gpu_train,
                     )
                     log.info(
                         "[bench]   p=%s trial=%s phase=%s wall_s=%.3f",

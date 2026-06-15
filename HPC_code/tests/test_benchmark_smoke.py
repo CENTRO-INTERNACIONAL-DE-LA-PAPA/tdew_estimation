@@ -104,14 +104,20 @@ def test_slurm_requires_queue() -> None:
         benchmark_scaling.make_bench_client(ns, 1)
 
 
-def test_gpu_guard(tmp_path: Path) -> None:
-    with pytest.raises(NotImplementedError):
-        benchmark_scaling.main(
-            [
-                "--base", str(tmp_path / "b"),
-                "--results", str(tmp_path / "r"),
-                "--hw", "gpu",
-                "--p-list", "1",
-                "--out-csv", str(tmp_path / "x.csv"),
-            ]
-        )
+def test_gpu_options_accepted() -> None:
+    """D3 Phase B un-gated GPU: --hw gpu / --gpu-train / --cluster cuda now parse cleanly
+    (no NotImplementedError). The actual GPU run is exercised by test_gpu_runner_smoke.py."""
+    args = benchmark_scaling.build_parser().parse_args(
+        [
+            "--base", "/tmp/b",
+            "--results", "/tmp/r",
+            "--hw", "gpu",
+            "--gpu-train",
+            "--cluster", "cuda",
+            "--p-list", "1,2",
+            "--out-csv", "/tmp/x.csv",
+        ]
+    )
+    assert args.hw == "gpu"
+    assert args.gpu_train is True
+    assert args.cluster == "cuda"

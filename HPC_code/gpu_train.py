@@ -26,6 +26,7 @@ r_squared_anom, ID``.
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 from typing import Any, List, Optional, Sequence, Tuple
@@ -40,10 +41,16 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE.parent))
 
-from tdew_estimation.anomaly_dask import BucketTrainingSummary, _failure_row  # noqa: E402
+from tdew_estimation.anomaly_dask import (  # noqa: E402
+    BucketTrainingSummary,
+    _error_bucket_summary,
+    _failure_row,
+)
 from tdew_estimation.anomaly_train import AnomalyTrainingConfig  # noqa: E402
-from tdew_estimation.bucket_layout import bucket_dir  # noqa: E402
-from tdew_estimation.parquet_io import read_parquet_any  # noqa: E402
+from tdew_estimation.bucket_layout import bucket_dir, discover_bucket_ids  # noqa: E402
+from tdew_estimation.parquet_io import as_path, read_parquet_any  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 DOY_AXIS = 366  # day-of-year bins, indices 0..365 for doy 1..366; circular modulo 366
 NF = 5  # features: [const, TMIN_anom, TD_anom_lag1, TD_anom_lag2, TMIN_anom_lag1]
@@ -323,10 +330,13 @@ def fit_anomaly_coeffs_for_bucket_gpu(
     *,
     doys: Optional[Sequence[int]] = None,
     backend: str = "rawkernel",
+    block: int = 128,
 ) -> pd.DataFrame:
     """Fit every (ID, doy) in a bucket on the GPU. Returns a coeffs frame (CPU schema).
 
     ``backend`` is ``"rawkernel"`` (production) or ``"reference"`` (array-level oracle).
+    ``block`` is the CUDA threads-per-block for the rawkernel launch (one thread per fit);
+    it tunes occupancy only and must not change results.
     """
     if train_df.empty or clim_df.empty:
         return pd.DataFrame(columns=COEFF_COLUMNS)
@@ -352,7 +362,7 @@ def fit_anomaly_coeffs_for_bucket_gpu(
     if backend == "reference":
         beta, r2 = solve_bucket_reference(A_v, b_v, syy_v)
     elif backend == "rawkernel":
-        beta, r2 = solve_bucket_rawkernel(A_v, b_v, syy_v)
+        beta, r2 = solve_bucket_rawkernel(A_v, b_v, syy_v, block=block)
     else:
         raise ValueError(f"Unknown backend: {backend!r} (use 'rawkernel' or 'reference').")
 
@@ -394,6 +404,7 @@ def _train_anomaly_bucket_task_gpu(
     failure_output_root=None,
     overwrite: bool = False,
     backend: str = "rawkernel",
+    block: int = 128,
 ) -> BucketTrainingSummary:
     """GPU analogue of ``anomaly_dask._train_anomaly_bucket_task`` (same I/O contract)."""
     bucket_training_dir = bucket_dir(prepared_training_root, bucket_id)
@@ -451,7 +462,7 @@ def _train_anomaly_bucket_task_gpu(
     if not train_df.empty and not clim_df.empty:
         try:
             coeffs_df = fit_anomaly_coeffs_for_bucket_gpu(
-                train_df, clim_df, config, doys=doys, backend=backend
+                train_df, clim_df, config, doys=doys, backend=backend, block=block
             )
         except Exception as exc:
             failures.append(
@@ -482,3 +493,121 @@ def _train_anomaly_bucket_task_gpu(
         coeffs_path=coeffs_file,
         failures_path=failures_file if (failures_file and not failures_df.empty) else None,
     )
+
+
+# ---------------------------------------------------------------------------------------
+# Runner: GPU analogue of anomaly_dask.run_bucketed_anomaly_training_dask.
+# ---------------------------------------------------------------------------------------
+def run_bucketed_anomaly_training_gpu(
+    *,
+    prepared_training_root,
+    bucketed_climatology_root,
+    coeffs_output_root,
+    config: AnomalyTrainingConfig,
+    bucket_ids: Optional[Sequence[int]] = None,
+    doys: Optional[Sequence[int]] = None,
+    failure_output_root=None,
+    overwrite: bool = False,
+    client: Optional[Any] = None,
+    backend: str = "rawkernel",
+    block: int = 128,
+    max_in_flight: int = 4,
+) -> List[BucketTrainingSummary]:
+    """Run GPU bucket training across many buckets (client-agnostic).
+
+    Mirrors :func:`tdew_estimation.anomaly_dask.run_bucketed_anomaly_training_dask` but
+    fits each bucket with the GPU batched-WLS task (:func:`_train_anomaly_bucket_task_gpu`).
+
+    ``client is None``
+        Process buckets **sequentially in-process** on the single visible GPU — no dask.
+        This is the dev-box / single-GPU verification path and needs no ``dask-cuda``.
+    ``client`` provided
+        Submit each bucket via the injected dask client (one worker per GPU, typically
+        built by :func:`hpc.make_local_cuda_cluster`) using the same sliding-window
+        ``as_completed`` structure as the CPU runner. A bucket whose task fails on a
+        worker is recorded as an error summary and skipped rather than aborting the run.
+
+    Returns summaries sorted by ``bucket_id``.
+    """
+    prepared_root_p = as_path(prepared_training_root)
+    clim_root_p = as_path(bucketed_climatology_root)
+    coeffs_root_p = as_path(coeffs_output_root)
+    coeffs_root_p.mkdir(parents=True, exist_ok=True)
+    failure_root_p = as_path(failure_output_root) if failure_output_root is not None else None
+    if failure_root_p is not None:
+        failure_root_p.mkdir(parents=True, exist_ok=True)
+
+    if bucket_ids is None:
+        buckets_to_run = discover_bucket_ids(prepared_root_p)
+    else:
+        buckets_to_run = sorted({int(b) for b in bucket_ids})
+    if not buckets_to_run:
+        raise ValueError(f"No buckets found under {prepared_root_p}")
+
+    def _task_kwargs(bucket_id: int) -> dict:
+        return dict(
+            bucket_id=int(bucket_id),
+            prepared_training_root=prepared_root_p,
+            bucketed_climatology_root=clim_root_p,
+            coeffs_output_root=coeffs_root_p,
+            config=config,
+            doys=doys,
+            failure_output_root=failure_root_p,
+            overwrite=overwrite,
+            backend=backend,
+            block=block,
+        )
+
+    summaries: List[BucketTrainingSummary] = []
+
+    # --- Single-GPU, no-dask path: fit buckets one at a time in this process. ---
+    if client is None:
+        for bid in buckets_to_run:
+            try:
+                summaries.append(_train_anomaly_bucket_task_gpu(**_task_kwargs(bid)))
+            except Exception as exc:  # one bad bucket must not abort the run
+                logger.warning("Bucket %s failed: %s: %s", bid, type(exc).__name__, exc)
+                summaries.append(_error_bucket_summary(bid, coeffs_root_p, exc))
+        return sorted(summaries, key=lambda item: item.bucket_id)
+
+    # --- Distributed path: submit via the injected dask(-cuda) client. ---
+    from distributed import as_completed  # imported lazily
+
+    n_workers = len(getattr(client, "scheduler_info", lambda: {})().get("workers", {})) or 1
+    window = max(int(max_in_flight) if max_in_flight else 0, n_workers)
+
+    def _submit(bucket_id: int):
+        return client.submit(
+            _train_anomaly_bucket_task_gpu,
+            **_task_kwargs(bucket_id),
+            pure=False,
+        )
+
+    pending: dict[Any, int] = {}
+    next_idx = 0
+    ac = as_completed()
+    # Prime the sliding window.
+    while next_idx < len(buckets_to_run) and len(pending) < window:
+        bid = buckets_to_run[next_idx]
+        fut = _submit(bid)
+        pending[fut] = bid
+        ac.add(fut)
+        next_idx += 1
+
+    for fut in ac:
+        bid = pending.pop(fut, -1)
+        try:
+            summaries.append(fut.result())
+        except Exception as exc:  # KilledWorker etc. must not abort the run
+            logger.warning("Bucket %s failed: %s: %s", bid, type(exc).__name__, exc)
+            summaries.append(_error_bucket_summary(bid, coeffs_root_p, exc))
+
+        # Top up the window with the next bucket, if any remain.
+        if next_idx < len(buckets_to_run):
+            bid = buckets_to_run[next_idx]
+            fut = _submit(bid)
+            pending[fut] = bid
+            ac.add(fut)
+            next_idx += 1
+
+    return sorted(summaries, key=lambda item: item.bucket_id)

@@ -125,6 +125,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs.")
 
+    p.add_argument(
+        "--gpu-train",
+        action="store_true",
+        help="Run the TRAIN phase on the GPU batched-WLS trainer (HPC_code/gpu_train.py) "
+        "instead of the CPU statsmodels path. Numerically equivalent (float64). Pair with "
+        "--cluster cuda for multi-GPU; without it, runs on the single local GPU.",
+    )
+    p.add_argument(
+        "--gpu-block",
+        type=int,
+        default=128,
+        help="CUDA threads-per-block for the GPU kernel (occupancy tuning; default 128). "
+        "Only used with --gpu-train; must not change results.",
+    )
+
     # Cluster selection
     p.add_argument("--cluster", choices=["local", "slurm", "cuda"], default="local")
     p.add_argument("--n-workers", type=int, default=1, help="Worker processes (CPU) or GPUs (cuda). This is P.")
@@ -208,6 +223,13 @@ def main(argv: list[str] | None = None) -> int:
         min_samples=args.min_samples,
     )
 
+    if args.gpu_train and args.cluster != "cuda":
+        print(
+            "[hpc] WARNING: --gpu-train without --cluster cuda — running the GPU trainer "
+            "on the single local GPU (client-agnostic, sequential buckets).",
+            flush=True,
+        )
+
     client, label = make_client(args)
     dashboard = getattr(client, "dashboard_link", "n/a")
     print(f"[hpc] cluster={label} dashboard={dashboard}", flush=True)
@@ -217,22 +239,41 @@ def main(argv: list[str] | None = None) -> int:
     try:
         # --- TRAIN-COEFFICIENTS (primary benchmarked phase) ---
         t0 = time.perf_counter()
-        train_summaries = run_bucketed_anomaly_training_dask(
-            prepared_training_root=prepared_root,
-            bucketed_climatology_root=clim_root,
-            coeffs_output_root=coeffs_root,
-            config=train_cfg,
-            bucket_ids=bucket_ids,
-            dask_config=DaskAnomalyConfig(
-                n_workers=args.n_workers,
-                threads_per_worker=args.threads,
-                batch_size=args.batch_size,
-                local_directory=args.local_dir,
-            ),
-            failure_output_root=failures_root,
-            overwrite=args.overwrite,
-            client=client,
-        )
+        if args.gpu_train:
+            from gpu_train import run_bucketed_anomaly_training_gpu  # lazy: needs CuPy
+
+            # Distribute over GPU workers only when a cuda cluster is up; otherwise run
+            # sequentially in-process on the single local GPU (client=None).
+            gpu_client = client if args.cluster == "cuda" else None
+            train_summaries = run_bucketed_anomaly_training_gpu(
+                prepared_training_root=prepared_root,
+                bucketed_climatology_root=clim_root,
+                coeffs_output_root=coeffs_root,
+                config=train_cfg,
+                bucket_ids=bucket_ids,
+                failure_output_root=failures_root,
+                overwrite=args.overwrite,
+                client=gpu_client,
+                block=args.gpu_block,
+                max_in_flight=args.batch_size,
+            )
+        else:
+            train_summaries = run_bucketed_anomaly_training_dask(
+                prepared_training_root=prepared_root,
+                bucketed_climatology_root=clim_root,
+                coeffs_output_root=coeffs_root,
+                config=train_cfg,
+                bucket_ids=bucket_ids,
+                dask_config=DaskAnomalyConfig(
+                    n_workers=args.n_workers,
+                    threads_per_worker=args.threads,
+                    batch_size=args.batch_size,
+                    local_directory=args.local_dir,
+                ),
+                failure_output_root=failures_root,
+                overwrite=args.overwrite,
+                client=client,
+            )
         train_s = time.perf_counter() - t0
         coeff_rows = sum(s.coeff_rows for s in train_summaries)
         fail_rows = sum(s.failure_rows for s in train_summaries)

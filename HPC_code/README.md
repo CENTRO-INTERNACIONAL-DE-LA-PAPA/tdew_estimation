@@ -22,8 +22,37 @@ outputs are identical; only the parallel-processor count `P` changes.
 | `requirements-gpu.txt` | Optional GPU/HPC deps (cu12 wheels + dask-jobqueue). |
 | `benchmark_scaling.py` | D4 driver: fresh cluster per `(p, trial)` → time the injected-client runners → append timing rows to a CSV. |
 | `analyze_scaling.py` | D4 analysis: median over trials → speedup `S(p)`/efficiency `E(p)` → markdown tables + PNG plots. |
+| `nc_to_point_parquet.py` | Extract PISCOt `.nc` rasters → per-point monthly parquet (Python/xarray port of the R/`terra` step). Potato-points or full-grid via `--peru-potato`. |
+| `sbatch/download_data.sh` | Download the 3 figshare PISCOt products (`.nc`) and run the extractor per variable. Resume-safe, idempotent, `BASE`/`VARS`-overridable. |
 | `_synth.py` | Tiny synthetic raw dataset generator (runs the real prep pipeline) for smoke tests. |
 | `tests/test_benchmark_smoke.py` | RAPIDS-free pytest smoke for the benchmark + analysis flow. |
+
+## Data preparation: PISCO `.nc` → point parquet
+
+The raw climate inputs are PISCOt `.nc` rasters; the pipeline consumes per-point monthly
+parquet (`{base}/{var}/Outputs/{var}_daily_YYYY_MM.parquet`, columns `ID,FECHA,Value`).
+`nc_to_point_parquet.py` is the headless Python/xarray port of the legacy R/`terra`
+extraction — verified to reproduce the existing parquet **bit-for-bit** (`max|Δ|=0`).
+
+```bash
+pip install -e .[netcdf]                  # xarray + netCDF4 (geopandas already in core)
+
+# Download all three products and extract at the potato-zoning centroids (~302k points):
+bash HPC_code/sbatch/download_data.sh                 # BASE/VARS/PERU_POTATO/PURGE_RAW overridable
+
+# Full PISCO grid (~2M points, heavier benchmark workload):
+PERU_POTATO=0 bash HPC_code/sbatch/download_data.sh
+
+# Safety gate — diff a fresh extraction against existing data before overwriting (no writes):
+python HPC_code/nc_to_point_parquet.py --var tmin --nc-dir <dir-with-one-.nc> \
+    --base "$BASE" --shp "$BASE/PotatoZonning/CENAGRO_OnlyPotatoes_Pisco_Altitude.shp" \
+    --peru-potato --verify-against-existing
+```
+
+`--peru-potato` (default) samples each daily layer at the CENAGRO potato centroids (the
+science subset, `ID` = shapefile feature order); `--no-peru-potato` keeps the full grid
+(`ID` = row-major `(lat,lon)`, plus a `grid_index.parquet`). Source→variable map:
+`tmin`←v1.1 TMIN, `td`←v1.1 TDEW, `tmin_v1`←v1.2 TMIN.
 
 ## Prerequisite: bucketed inputs
 

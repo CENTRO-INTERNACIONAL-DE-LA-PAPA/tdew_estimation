@@ -54,7 +54,7 @@ SCRATCH="${TMPDIR:-/tmp}/dask-tdew-$USER"
 mkdir -p "$RESULTS"
 
 if [[ "$MODE" == "benchmark" ]]; then
-  # (1) kernel micro-benchmark: block sweep at fixed M + throughput sweep at the best block.
+  # (1) solve-kernel micro-benchmark: block sweep at fixed M + throughput sweep at best block.
   KERNEL_CSV="${KERNEL_CSV:-$RESULTS/gpu_kernel.csv}"
   BLOCKS="${BLOCKS:-32,64,128,256,512}"
   KM="${KM:-200000}"                        # #fits for the block sweep
@@ -63,6 +63,14 @@ if [[ "$MODE" == "benchmark" ]]; then
   "$PYTHON" HPC_code/benchmark_gpu_kernel.py \
     --m "$KM" --blocks "$BLOCKS" --m-list "$M_LIST" \
     --best-block "$GPU_BLOCK" --reps "$REPS" --out-csv "$KERNEL_CSV"
+
+  # (1b) full-pipeline roofline: per-stage (assemble/convolve/solve) GFLOPS + AI, curves per
+  #      N=IDs/bucket over the M=#fits axis (analyze with analyze_gpu.py --pipeline-csv).
+  PIPELINE_CSV="${PIPELINE_CSV:-$RESULTS/gpu_pipeline.csv}"
+  N_IDS_LIST="${N_IDS_LIST:-64,128,293,512,1024}"
+  "$PYTHON" HPC_code/benchmark_gpu_pipeline.py \
+    --n-ids-list "$N_IDS_LIST" --years "${YEARS:-40}" --block "$GPU_BLOCK" \
+    --reps "${PIPE_REPS:-10}" --out-csv "$PIPELINE_CSV"
 
   # (2) single-GPU end-to-end point (same CSV schema as the CPU sweep -> CPU-vs-GPU overlay).
   SCALING_CSV="${SCALING_CSV:-$RESULTS/scaling_gpu.csv}"
@@ -75,7 +83,10 @@ if [[ "$MODE" == "benchmark" ]]; then
     --mode strong --p-list 1 --trials "$TRIALS" --num-buckets "$NUM_BUCKETS" \
     --phases train --dataset-label "$DATASET_LABEL" --out-csv "$SCALING_CSV" \
     --batch-size 64 --local-dir "$SCRATCH" ${SYNTH:+--synth}
-  echo "[sbatch] GPU CSVs -> $KERNEL_CSV , $SCALING_CSV (analyse with HPC_code/analyze_gpu.py)"
+  echo "[sbatch] GPU CSVs -> $KERNEL_CSV , $PIPELINE_CSV , $SCALING_CSV"
+  echo "[sbatch] analyse: HPC_code/analyze_gpu.py --kernel-csv $KERNEL_CSV \\"
+  echo "             --pipeline-csv $PIPELINE_CSV --scaling-csv $SCALING_CSV \\"
+  echo "             --peak-fp64-gflops 4200 --out-dir $RESULTS/gpu_plots --md-out $RESULTS/gpu_report.md"
 else
   "$PYTHON" HPC_code/run_training_hpc.py \
     --base "$BASE" --results "$RESULTS" \

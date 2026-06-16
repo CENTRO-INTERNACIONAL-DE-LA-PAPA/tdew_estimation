@@ -98,6 +98,9 @@ def test_coeff_comparison_reports_injected_difference(tmp_path):
     # untouched coefficients are identical between A and B.
     assert delta.loc["TMIN_anom_coeff", "max_abs_delta"] == pytest.approx(0.0, abs=1e-9)
     assert delta.loc["TD_anom_lag1", "pearson_r"] == pytest.approx(1.0, abs=1e-9)
+    # identical column (untouched) -> cosine of a vector with itself is exactly 1.
+    assert "cosine" in delta.columns
+    assert delta.loc["TMIN_anom_coeff", "cosine"] == pytest.approx(1.0, abs=1e-9)
 
 
 def test_prediction_comparison_metrics(tmp_path):
@@ -123,6 +126,7 @@ def test_prediction_comparison_metrics(tmp_path):
     assert ag["mae"] == pytest.approx(BIAS, abs=1e-9)
     assert ag["rmse"] == pytest.approx(BIAS, abs=1e-9)
     assert ag["pearson_r"] == pytest.approx(1.0, abs=1e-9)
+    assert "cosine" in ag and ag["cosine"] == pytest.approx(1.0, abs=1e-3)
     # monthly table covers the months present (Jan–Apr for 120 days from Jan 1).
     assert set(res["monthly"]["month"]) <= set(range(1, 13))
     assert (res["monthly"]["mean_abs_delta"] - BIAS).abs().max() == pytest.approx(0.0, abs=1e-9)

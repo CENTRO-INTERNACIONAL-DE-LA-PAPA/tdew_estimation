@@ -1149,17 +1149,19 @@ the sequential pipeline dependencies set the practical ceiling.
 
 ### Definition of a "processor" `p`
 
-To compare CPU and GPU on one axis, `p` counts independent worker slots:
+For the **CPU** study, `p` counts independent worker slots:
 
 | Hardware | One processor (`p` unit) | How `p` is varied |
 |---|---|---|
 | CPU (SLURM) | one single-threaded Dask worker process (one core, BLAS pinned to 1 thread) | `dask_jobqueue.SLURMCluster` scaled to `p` workers |
-| GPU (A100) | one A100 GPU (one `dask-cuda` worker) | `p` = number of A100s in the allocation |
 
-Within a single GPU, the batched weighted-least-squares solver uses all CUDA cores;
-that intra-device parallelism is held fixed and absorbed into the constant `c`, so
-the reported `p` axis is the number of GPUs. This keeps `S(p)` and `E(p)` meaningful
-across hardware: both answer "how much faster with `p` independent workers".
+The **GPU** study is different. The target deployment (KHIPU) exposes exactly **one** A100
+**MIG slice** (`a100_3g.20gb`; account limit `gres/gpu=1`), so there is **no GPU `p`-sweep** —
+`p_{GPU}=1` always. Reporting `S(p)`/`E(p)` over GPUs is therefore not meaningful here.
+Instead the GPU is characterised by **throughput and a roofline** as the *problem size* grows:
+the x-axis is **M = number of fits** (`≈ N·366`) and curves are drawn per **N = IDs per
+bucket** (the data volume). This measures the inner (batched) parallelism that is the GPU's
+actual source of speed, and is compared head-to-head with the CPU sweep in wall-clock terms.
 
 ### Controls
 
@@ -1188,12 +1190,10 @@ of workers.
 ### Strong scaling (fixed problem, more processors)
 
 Hold the problem size fixed at the full grid (or a fixed representative subset of
-`N` IDs) and vary `p`:
+`N` IDs) and vary `p` (CPU only; the GPU has a single device — see the GPU roofline below):
 
 $$
-p \in \{1, 2, 4, 8, 16, 32, \dots\} \text{ (CPU)}
-\qquad
-p \in \{1, 2, 4, 8\} \text{ (A100 GPUs)}
+p \in \{1, 2, 4, 8, 16, 32\} \text{ (CPU; KHIPU account limit } cpu=32\text{)}
 $$
 
 For each `p` we record `T(p)` for the dominant **train-coefficients** phase (and,
@@ -1223,30 +1223,60 @@ which is ideally `1`. Because the per-`(ID, doy)` fits are independent, the
 compute part of training is expected to weak-scale well; departures isolate I/O and
 scheduling overhead that grow with the number of workers.
 
-### Datasets: PISCOt v1.0 vs v2.0
+### GPU roofline (single device, problem size grows)
 
-The full strong- and weak-scaling protocol is run on both dataset versions. The two
-versions are supplied to the same pipeline through the input path / variable-folder
-parameters (`--base`, `--td-var`, `--tmin-var`) writing to separate result roots, so
-no code differs between runs. We compare:
+Because only one GPU (MIG `a100_3g.20gb`) is available, the GPU is evaluated as a
+**throughput / roofline** study rather than a processor sweep. The GPU training of a bucket
+has three stages, benchmarked separately (`benchmark_gpu_pipeline.py`, timed with CUDA events):
 
-- **Performance**: `T(p)`, `S(p)`, `E(p)` curves for v1.0 vs v2.0 (the work `W`
+1. **assemble** — scatter raw rows into per-`(ID, doy)` `5×5` sufficient statistics
+   (`XᵀWX`, `XᵀWy`, `Σwy²`);
+2. **convolve** — `2h+1` weighted circular rolls over the day-of-year axis (the local window);
+3. **solve** — the fused one-thread-per-fit `5×5` Cholesky kernel.
+
+We sweep **N = IDs per bucket** (so **M = #fits ≈ N·366** on the x-axis) and report, per stage:
+execution time vs `M`, throughput (fits/s) and **time-per-fit** vs `M`, achieved **GFLOPS**,
+and **arithmetic intensity** `I = FLOPs / bytes` placed on a **roofline**. The attainable
+performance is `min(π, I·β)` for compute peak `π` (FP64) and memory bandwidth `β` (HBM,
+measured empirically on the slice with a large copy).
+
+A short analytic FLOP/byte model (FP64) is used. The solve kernel does ≈ 180 FLOP/fit and
+moves ≈ 296 B/fit (read `A[5×5], b[5], Σwy²`; write `β[5], r²`), so its intensity is
+`I ≈ 0.6 FLOP/byte`; the assemble (scatter) and convolve (streaming rolls) stages have even
+lower intensity (`I ≈ 0.1`). All three lie far to the **left of the roofline ridge**
+(`π/β ≈ 5 FLOP/byte`), so the GPU pipeline is **memory-bandwidth bound** — its speed comes from
+the inner batch width (≈ `10⁵` fits cleared per wave), not FP64 throughput. The single-GPU
+end-to-end time is also compared directly against the CPU sweep (wall-clock, same workload).
+
+### Datasets: PISCOt v1.1 vs v1.2
+
+The full strong- and weak-scaling protocol is run on both TMIN dataset versions, **PISCOt
+v1.1** (folder `tmin_v11`, figshare 16372509, 1981–2016) and **PISCOt v1.2** (folder
+`tmin_v12`, figshare 20533715, 1981–2020); the shared dewpoint target is PISCOt v1.1 TDEW
+(`td`). The comparison window is the overlap **1981–2016**. The two versions are supplied to
+the same pipeline through the input path / variable-folder parameters (`--base`, `--td-var`,
+`--tmin-var`) writing to separate result roots, so no code differs between runs. We compare:
+
+- **Performance**: `T(p)`, `S(p)`, `E(p)` curves for v1.1 vs v1.2 (the work `W`
   differs only if `N`, `Y`, or data density differ between versions).
-- **Science**: distributions of the fitted coefficients and of the prediction skill,
-  to assess how the dataset version affects the estimated model, independent of
-  runtime.
+- **Science**: distributions of the fitted coefficients and of the prediction skill —
+  RMSE, MAE, bias, Pearson `r`, and **cosine similarity** (predicted-vs-observed `TD`, and
+  v1.1-vs-v1.2 agreement) — to assess how the dataset version affects the estimated model,
+  independent of runtime.
 
 ### Hardware configurations
 
-| Configuration | Cluster | `p` swept |
+| Configuration | Cluster | Axis swept |
 |---|---|---|
-| CPU multi-node | `dask_jobqueue.SLURMCluster` (one process per core, `B \geq 4p_{max}`) | worker processes |
-| GPU single/multi-A100 | `dask-cuda` (`LocalCUDACluster` or SLURM `--gres=gpu:a100:p`) | number of A100s |
+| CPU multi-node | `dask_jobqueue.SLURMCluster` (one process per core, `B \geq 4p_{max}`) | `p` worker processes ∈ {1,…,32} |
+| GPU single device | one MIG `a100_3g.20gb` slice, in-process (`client=None`, no `dask-cuda`) | `M = #fits` (problem size), per `N`=IDs/bucket |
 
 ### Reporting
 
-For each (dataset × hardware) combination we produce: (1) a table of `T(p)`, `S(p)`,
-`E(p)` for the strong-scaling sweep; (2) a table of `E_{weak}(p)`; and (3) three
-plots — execution time vs `p`, speedup vs `p` (with the ideal `S(p)=p` reference),
-and efficiency vs `p`. These quantify both how the implementation scales and which
-hardware minimizes wall-clock time for this workload.
+For each dataset we produce, on **CPU**: (1) a table of `T(p)`, `S(p)`, `E(p)` for the
+strong-scaling sweep; (2) a table of `E_{weak}(p)`; and (3) three plots — execution time vs
+`p`, speedup vs `p` (with the ideal `S(p)=p` reference), and efficiency vs `p`. On **GPU**
+(single device): per-stage execution-time, throughput, time-per-fit and GFLOPS vs `M`; a
+**roofline** (achieved GFLOPS vs arithmetic intensity with the compute/bandwidth ceilings);
+and a **CPU-vs-GPU** wall-clock comparison. Together these quantify how the implementation
+scales and which hardware minimizes wall-clock time for this workload.

@@ -156,6 +156,7 @@ def compare_coeffs(
                 "mean_abs_delta": np.nanmean(np.abs(d)),
                 "max_abs_delta": np.nanmax(np.abs(d)),
                 "pearson_r": _safe_corr(va, vb),
+                "cosine": _cosine(va, vb),
             }
         )
     delta = pd.DataFrame(delta_rows)
@@ -207,6 +208,7 @@ def compare_predictions(
         "mae": float(np.nanmean(np.abs(d))) if mask.any() else float("nan"),
         "bias": float(np.nanmean(d)) if mask.any() else float("nan"),
         "pearson_r": _safe_corr(va, vb),
+        "cosine": _cosine(va, vb),
     }
 
     merged["abs_delta"] = np.abs(d)
@@ -230,6 +232,24 @@ def _safe_corr(x: np.ndarray, y: np.ndarray) -> float:
     if np.std(xs) == 0 or np.std(ys) == 0:
         return float("nan")
     return float(np.corrcoef(xs, ys)[0, 1])
+
+
+def _cosine(x: np.ndarray, y: np.ndarray) -> float:
+    """Cosine similarity Σxy / (‖x‖·‖y‖) over finite pairs; NaN if either vector is ~0.
+
+    Unlike Pearson r this is *not* mean-centred — it is the raw angle between the two
+    vectors (the metric used by the inspiring paper). On mean-centred inputs it coincides
+    with Pearson r. Returned in [-1, 1].
+    """
+    m = np.isfinite(x) & np.isfinite(y)
+    if m.sum() < 1:
+        return float("nan")
+    xs, ys = x[m], y[m]
+    nx = float(np.sqrt(np.dot(xs, xs)))
+    ny = float(np.sqrt(np.dot(ys, ys)))
+    if nx == 0.0 or ny == 0.0:
+        return float("nan")
+    return float(np.dot(xs, ys) / (nx * ny))
 
 
 # ---------------------------------------------------------------------------------------
@@ -265,13 +285,14 @@ def write_markdown(
     lines += [
         f"### Paired Δ = {label_b} − {label_a} (common fits)",
         "",
-        "| coeff | mean Δ | std Δ | mean &#124;Δ&#124; | max &#124;Δ&#124; | Pearson r |",
-        "|---|---:|---:|---:|---:|---:|",
+        "| coeff | mean Δ | std Δ | mean &#124;Δ&#124; | max &#124;Δ&#124; | Pearson r | cosine |",
+        "|---|---:|---:|---:|---:|---:|---:|",
     ]
     for _, r in coeff_res["delta"].iterrows():
         lines.append(
             f"| {r['coeff']} | {r['mean_delta']:.4g} | {r['std_delta']:.4g} | "
-            f"{r['mean_abs_delta']:.4g} | {r['max_abs_delta']:.4g} | {r['pearson_r']:.4f} |"
+            f"{r['mean_abs_delta']:.4g} | {r['max_abs_delta']:.4g} | {r['pearson_r']:.4f} | "
+            f"{r['cosine']:.4f} |"
         )
     lines.append("")
 
@@ -284,11 +305,11 @@ def write_markdown(
         for k, v in cov.items():
             lines.append(f"| {k} | {v} |")
         lines.append("")
-        lines += ["### Agreement", "", "| n | RMSE | MAE | bias (B−A) | Pearson r |"]
-        lines.append("|---:|---:|---:|---:|---:|")
+        lines += ["### Agreement", "", "| n | RMSE | MAE | bias (B−A) | Pearson r | cosine |"]
+        lines.append("|---:|---:|---:|---:|---:|---:|")
         lines.append(
             f"| {ag['n']} | {ag['rmse']:.4g} | {ag['mae']:.4g} | {ag['bias']:.4g} | "
-            f"{ag['pearson_r']:.4f} |"
+            f"{ag['pearson_r']:.4f} | {ag['cosine']:.4f} |"
         )
         lines.append("")
         lines += ["### Monthly mean &#124;Δ&#124;", "", "| month | mean &#124;Δ&#124; |", "|---:|---:|"]

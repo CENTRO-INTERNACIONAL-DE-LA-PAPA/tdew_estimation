@@ -53,7 +53,7 @@ import sys  # noqa: E402
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE.parent))
 
-from compare_datasets import _safe_corr, load_dataset  # noqa: E402
+from compare_datasets import _cosine, _safe_corr, load_dataset  # noqa: E402
 
 log = logging.getLogger("evaluate_accuracy")
 
@@ -95,6 +95,7 @@ def score(pred: pd.DataFrame, obs: pd.DataFrame, *, label: str) -> dict:
         "mae": float(np.nanmean(np.abs(err[m]))) if m.any() else float("nan"),
         "bias": float(np.nanmean(err[m])) if m.any() else float("nan"),
         "pearson_r": _safe_corr(pv, ov),
+        "cosine": _cosine(pv, ov),
     }
 
     merged = merged.assign(err=err)
@@ -105,6 +106,9 @@ def score(pred: pd.DataFrame, obs: pd.DataFrame, *, label: str) -> dict:
             "rmse": float(np.sqrt(np.nanmean(g["err"].to_numpy() ** 2))),
             "mae": float(np.nanmean(np.abs(g["err"].to_numpy()))),
             "bias": float(np.nanmean(g["err"].to_numpy())),
+            "cosine": _cosine(
+                g[PRED_VALUE].to_numpy(dtype=float), g["td_obs"].to_numpy(dtype=float)
+            ),
         }), include_groups=False)
         .reset_index()
         .sort_values("month")
@@ -118,13 +122,14 @@ def score(pred: pd.DataFrame, obs: pd.DataFrame, *, label: str) -> dict:
 def write_markdown(results: list[dict], md_out: Path) -> None:
     lines: list[str] = ["# Forecast accuracy vs observed TD", ""]
 
-    lines += ["## Overall skill", "", "| run | n scored | RMSE | MAE | bias (pred−obs) | Pearson r |"]
-    lines.append("|---|---:|---:|---:|---:|---:|")
+    lines += ["## Overall skill", "",
+              "| run | n scored | RMSE | MAE | bias (pred−obs) | Pearson r | cosine |"]
+    lines.append("|---|---:|---:|---:|---:|---:|---:|")
     for res in results:
         o = res["overall"]
         lines.append(
             f"| {o['label']} | {o['n_scored']} | {o['rmse']:.4g} | {o['mae']:.4g} | "
-            f"{o['bias']:.4g} | {o['pearson_r']:.4f} |"
+            f"{o['bias']:.4g} | {o['pearson_r']:.4f} | {o['cosine']:.4f} |"
         )
     lines.append("")
 
@@ -141,10 +146,12 @@ def write_markdown(results: list[dict], md_out: Path) -> None:
 
     for res in results:
         o = res["overall"]
-        lines += [f"## Monthly skill — {o['label']}", "", "| month | RMSE | MAE | bias |", "|---:|---:|---:|---:|"]
+        lines += [f"## Monthly skill — {o['label']}", "",
+                  "| month | RMSE | MAE | bias | cosine |", "|---:|---:|---:|---:|---:|"]
         for _, r in res["monthly"].iterrows():
             lines.append(
-                f"| {int(r['month'])} | {r['rmse']:.4g} | {r['mae']:.4g} | {r['bias']:.4g} |"
+                f"| {int(r['month'])} | {r['rmse']:.4g} | {r['mae']:.4g} | {r['bias']:.4g} | "
+                f"{r['cosine']:.4f} |"
             )
         lines.append("")
 

@@ -23,6 +23,8 @@ outputs are identical; only the parallel-processor count `P` changes.
 | `benchmark_scaling.py` | D4 driver: fresh cluster per `(p, trial)` → time the injected-client runners → append timing rows to a CSV. |
 | `analyze_scaling.py` | D4 analysis: median over trials → speedup `S(p)`/efficiency `E(p)` → markdown tables + PNG plots. |
 | `nc_to_point_parquet.py` | Extract PISCOt `.nc` rasters → per-point monthly parquet (Python/xarray port of the R/`terra` step). Potato-points or full-grid via `--peru-potato`. |
+| `prep_inputs.py` | **Phase 0**: build the reusable bucketed inputs (climatology, bucket-year dataset, climatology/future-TMIN shards) — *no training*. Run once per dataset version. |
+| `benchmark_gpu_pipeline.py` | Single-GPU **roofline** of the full bucket path (assemble/convolve/solve): per-stage GFLOPS + arithmetic intensity, swept over N=IDs/bucket. |
 | `sbatch/download_data.sh` | Download the 3 figshare PISCOt products (`.nc`) and run the extractor per variable. Resume-safe, idempotent, `BASE`/`VARS`-overridable. |
 | `_synth.py` | Tiny synthetic raw dataset generator (runs the real prep pipeline) for smoke tests. |
 | `tests/test_benchmark_smoke.py` | RAPIDS-free pytest smoke for the benchmark + analysis flow. |
@@ -59,12 +61,99 @@ to their real PISCOt version — confirmed bit-for-bit against figshare). Source
 1981–2020), `td`←PISCOt v1.1 TDEW (16305341, 1981–2016). The v11-vs-v12 comparison overlaps
 1981–2016.
 
-## Prerequisite: bucketed inputs
+## Dataset choice: potato-only vs whole PISCO
 
-`run_training_hpc.py` runs only the parallel **compute** phases. Build the bucketed
-inputs once (locally or in a prep job) with `../Local/run_pipeline.sh`, so that under
-`--results` you have `bucketed_training_data/`, `climatology_by_bucket/`, and — for
-forecasting — `future_tmin_by_bucket/`.
+Every command below operates on whatever lives under `--base`. **Which points** are in the
+data is fixed when it is *extracted* (`sbatch/download_data.sh`), not later:
+
+```bash
+# Potato planting zones only (~302k points) — the default, already extracted:
+export BASE=/media/ppalacios/Data/henry_simcast_peru
+
+# OR the whole PISCO grid (~2M points) — extract ONCE into a SEPARATE base (so it does not
+# overwrite the potato data), then point everything at it:
+PERU_POTATO=0 BASE=/media/ppalacios/Data/pisco_full bash HPC_code/sbatch/download_data.sh
+export BASE=/media/ppalacios/Data/pisco_full
+```
+
+The whole-grid run is ~6.6× the work (heavier scaling workload); the potato subset is the
+science target. Pick `BASE` accordingly — nothing else changes.
+
+## Phase 0: prep the bucketed inputs (run once per version)
+
+`run_training_hpc.py` / `benchmark_scaling.py` run only the **compute** phases; they assume
+the bucketed inputs already exist under `--results`. Build them once per dataset version with
+`prep_inputs.py` (no training):
+
+```bash
+mkdir -p logs
+# PISCOt v1.1:
+python HPC_code/prep_inputs.py --base "$BASE" --results results_v11 \
+    --td-var td --tmin-var tmin_v11 --train-start 1981 --train-end 2016 \
+    --pred-start 2017 --pred-end 2020 --num-buckets 1024
+# PISCOt v1.2:
+python HPC_code/prep_inputs.py --base "$BASE" --results results_v12 \
+    --td-var td --tmin-var tmin_v12 --train-start 1981 --train-end 2016 \
+    --pred-start 2017 --pred-end 2020 --num-buckets 1024
+```
+
+This writes under each `results_*/`: `daily_climatology.parquet`, `bucketed_training_data/`,
+`climatology_by_bucket/`, `future_tmin_by_bucket/`. **The dataset version is baked in here**
+(via `--tmin-var`); downstream jobs just point at `--results`. On KHIPU wrap it on the CPU
+partition, e.g. `srun -p standard -A postgrado -c 16 python HPC_code/prep_inputs.py …`.
+Use `--num-buckets 1024` so `B ≥ 4·p_max` for the CPU scaling sweep.
+
+## Runbook A — prep → benchmark → results
+
+Measure scaling/throughput (re-uses the Phase-0 `results_v11`; swap to `results_v12` for v1.2):
+
+```bash
+# CPU strong + weak scaling (KHIPU: standard/postgrado preset in the sbatch).
+MODE=benchmark BASE="$BASE" RESULTS=results_v11 DATASET_LABEL=v11 \
+    P_LIST=1,2,4,8,16,32 TRIALS=3 NUM_BUCKETS=1024 \
+    sbatch HPC_code/sbatch/train_cpu.sbatch                       # -> results_v11/scaling_cpu_v11.csv
+MODE=benchmark BENCH_MODE=weak BASE="$BASE" RESULTS=results_v11 DATASET_LABEL=v11 \
+    P_LIST=1,2,4,8,16,32 N0=4 sbatch HPC_code/sbatch/train_cpu.sbatch   # appends weak rows
+
+# GPU roofline (kernel + full-pipeline) + single-GPU end-to-end point (KHIPU: gpu/ag001/MIG).
+MODE=benchmark BASE="$BASE" RESULTS=results_v11 DATASET_LABEL=v11 \
+    sbatch HPC_code/sbatch/train_gpu_a100.sbatch
+    # -> results_v11/{gpu_kernel.csv, gpu_pipeline.csv, scaling_gpu.csv}
+
+# Turn the CSVs into tables + plots:
+python HPC_code/analyze_scaling.py --csv results_v11/scaling_cpu_v11.csv \
+    --out-dir results_v11/cpu_plots --md-out results_v11/cpu_tables.md
+python HPC_code/analyze_gpu.py --kernel-csv results_v11/gpu_kernel.csv \
+    --pipeline-csv results_v11/gpu_pipeline.csv --scaling-csv results_v11/scaling_gpu.csv \
+    --peak-fp64-gflops 4200 --out-dir results_v11/gpu_plots --md-out results_v11/gpu_report.md
+```
+
+**Where the results land** (under `results_v11/`):
+- CSVs: `scaling_cpu_v11.csv` (CPU strong+weak), `gpu_kernel.csv`, `gpu_pipeline.csv`, `scaling_gpu.csv`.
+- CPU tables/plots: `cpu_tables.md` + `cpu_plots/` (`speedup_*`, `efficiency_*`, `time_*`.png).
+- GPU report/plots: `gpu_report.md` + `gpu_plots/` (`gpu_roofline.png`, `gpu_pipeline_*_vs_M.png`,
+  `gpu_block_tuning.png`, `gpu_throughput.png`, `cpu_vs_gpu.png`).
+
+(For the GPU roofline ceiling, confirm the MIG slice's FP64 peak / HBM BW on `ag001`;
+`benchmark_gpu_pipeline.py` also measures bandwidth empirically.)
+
+## Runbook B — prep → train on the data
+
+Produce the actual coefficients (+ optional forecast), not a benchmark:
+
+```bash
+# CPU multi-node training at P=32, with forecast:
+BASE="$BASE" RESULTS=results_v11 P=32 FORECAST=1 \
+    sbatch HPC_code/sbatch/train_cpu.sbatch
+
+# OR train on the single GPU (client=None, no dask-cuda):
+BASE="$BASE" RESULTS=results_v11 FORECAST=1 \
+    sbatch HPC_code/sbatch/train_gpu_a100.sbatch
+```
+
+**Outputs** (under `results_v11/`): `llr_coeffs_anomaly_dataset/` (fitted coefficients per
+bucket) and, with `FORECAST=1`, `predictions/` (+ combined `td_predictions.parquet`). Swap
+`results_v11`→`results_v12` to train on v1.2. For a single dev box, add `CLUSTER=local`.
 
 ## Install
 

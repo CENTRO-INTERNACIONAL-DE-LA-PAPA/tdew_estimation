@@ -98,7 +98,7 @@ def build_bucketed_training_dataset(
     base_path: PathLike,
     output_dir: PathLike,
     td_var: str = "td",
-    tmin_var: str = "tmin_v1",
+    tmin_var: str = "tmin_v12",
     outputs_subdir: str = "Outputs",
     num_buckets: int = 1024,
     overwrite: bool = False,

@@ -135,14 +135,138 @@ def plot_cpu_vs_gpu(cg: dict, out_dir: Path) -> list[Path]:
 
 
 # ---------------------------------------------------------------------------------------
+# Pipeline CSV: per-stage roofline + curves over M (from benchmark_gpu_pipeline.py).
+# ---------------------------------------------------------------------------------------
+_STAGES = ["assemble", "convolve", "solve", "total"]
+_STAGE_COLOR = {
+    "assemble": "tab:blue",
+    "convolve": "tab:orange",
+    "solve": "tab:green",
+    "total": "black",
+}
+
+
+def pipeline_tables(pdf: pd.DataFrame) -> dict:
+    """Sort the pipeline CSV and derive time-per-fit (µs)."""
+    df = pdf.copy().sort_values(["stage", "M_fits"]).reset_index(drop=True)
+    df["t_per_fit_us"] = df["time_ms_median"] * 1000.0 / df["M_fits"]
+    bw = float(df["meas_bw_gbs"].median()) if "meas_bw_gbs" in df else float("nan")
+    return {"df": df, "meas_bw_gbs": bw}
+
+
+def plot_pipeline_curves(pt: dict, out_dir: Path) -> list[Path]:
+    """time vs M, GFLOPS vs M, and time-per-fit vs M — one curve per stage."""
+    df = pt["df"]
+    if df.empty:
+        return []
+    written: list[Path] = []
+    specs = [
+        ("time_ms_median", "kernel time (ms, median)", "gpu_pipeline_time_vs_M.png", "GPU pipeline: time vs M", True),
+        ("gflops", "achieved GFLOPS (FP64)", "gpu_pipeline_gflops_vs_M.png", "GPU pipeline: GFLOPS vs M", True),
+        ("t_per_fit_us", "time per fit (µs)", "gpu_pipeline_tperfit_vs_M.png", "GPU pipeline: time/fit vs M", True),
+    ]
+    for col, ylabel, fname, title, ylog in specs:
+        fig, ax = plt.subplots(figsize=(5.5, 4))
+        for st in _STAGES:
+            s = df[df["stage"] == st].sort_values("M_fits")
+            if not s.empty:
+                ax.plot(s["M_fits"], s[col], marker="o", label=st, color=_STAGE_COLOR[st])
+        ax.set_xlabel("number of fits M (= N·366)")
+        ax.set_ylabel(ylabel)
+        ax.set_xscale("log")
+        if ylog:
+            ax.set_yscale("log")
+        ax.set_title(title)
+        ax.legend()
+        ax.grid(True, which="both", alpha=0.3)
+        f = out_dir / fname
+        fig.tight_layout()
+        fig.savefig(f, dpi=120)
+        plt.close(fig)
+        written.append(f)
+    return written
+
+
+def plot_roofline(
+    pt: dict, out_dir: Path, *, peak_fp64_gflops: Optional[float], peak_bw_gbs: Optional[float]
+) -> list[Path]:
+    """Roofline: achieved GFLOPS vs arithmetic intensity, with memory + (optional) compute ceilings."""
+    df = pt["df"]
+    if df.empty:
+        return []
+    bw = peak_bw_gbs if peak_bw_gbs is not None else pt["meas_bw_gbs"]
+    fig, ax = plt.subplots(figsize=(6, 4.5))
+
+    ai_min = max(float(df["ai_flop_per_byte"].min()) * 0.3, 1e-3)
+    ai_max = float(df["ai_flop_per_byte"].max()) * 30
+    ai_line = [ai_min, ai_max]
+    # Memory-bound ceiling: GFLOPS = AI · BW(GB/s). (BW in GB/s, AI in FLOP/byte -> GFLOP/s.)
+    mem = [ai * bw for ai in ai_line]
+    ax.plot(ai_line, mem, "--", color="gray", label=f"HBM BW ceiling ({bw:.0f} GB/s)")
+    if peak_fp64_gflops is not None:
+        ax.axhline(peak_fp64_gflops, linestyle=":", color="firebrick",
+                   label=f"FP64 peak ({peak_fp64_gflops:.0f} GFLOPS)")
+        ridge = peak_fp64_gflops / bw
+        ax.axvline(ridge, linestyle=":", color="lightgray")
+        ax.text(ridge, mem[0], f" ridge AI≈{ridge:.1f}", fontsize=8, color="gray")
+
+    for st in _STAGES:
+        s = df[df["stage"] == st]
+        if not s.empty:
+            ax.scatter(s["ai_flop_per_byte"], s["gflops"], label=st, color=_STAGE_COLOR[st], zorder=5)
+
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("arithmetic intensity (FLOP / byte)")
+    ax.set_ylabel("achieved GFLOPS (FP64)")
+    ax.set_title("Roofline — GPU training pipeline (one device)")
+    ax.legend(fontsize=8)
+    ax.grid(True, which="both", alpha=0.3)
+    f = out_dir / "gpu_roofline.png"
+    fig.tight_layout()
+    fig.savefig(f, dpi=120)
+    plt.close(fig)
+    return [f]
+
+
+# ---------------------------------------------------------------------------------------
 # Markdown.
 # ---------------------------------------------------------------------------------------
 def write_markdown(
     kt: Optional[dict],
     cg: Optional[dict],
     md_out: Path,
+    pt: Optional[dict] = None,
+    *,
+    peak_fp64_gflops: Optional[float] = None,
 ) -> None:
     lines: list[str] = ["# GPU performance (single device)", ""]
+
+    if pt is not None and not pt["df"].empty:
+        df = pt["df"]
+        bw = pt["meas_bw_gbs"]
+        intro = f"Measured HBM bandwidth: **{bw:.0f} GB/s**."
+        if peak_fp64_gflops:
+            intro = (
+                f"Measured HBM bandwidth: **{bw:.0f} GB/s**; FP64 peak: "
+                f"**{peak_fp64_gflops:.0f} GFLOPS** (ridge AI ≈ {peak_fp64_gflops / bw:.1f})."
+            )
+        intro += " Every stage sits at AI well below the ridge → **memory-bound**."
+        lines += [
+            "## Full-pipeline roofline (assemble / convolve / solve)",
+            "",
+            intro,
+            "",
+            "| N (IDs) | M (fits) | stage | time ms | GFLOPS | AI (FLOP/B) | fits/s |",
+            "|---:|---:|---|---:|---:|---:|---:|",
+        ]
+        for _, r in df.sort_values(["n_ids", "stage"]).iterrows():
+            lines.append(
+                f"| {int(r['n_ids'])} | {int(r['M_fits'])} | {r['stage']} | "
+                f"{r['time_ms_median']:.4f} | {r['gflops']:.3g} | "
+                f"{r['ai_flop_per_byte']:.4f} | {r['fits_per_s']:.3e} |"
+            )
+        lines.append("")
 
     if kt is not None:
         block, size = kt["block"], kt["size"]
@@ -207,7 +331,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--kernel-csv", type=Path, default=None, help="From benchmark_gpu_kernel.py.")
     p.add_argument("--scaling-csv", type=Path, default=None, help="From benchmark_scaling.py.")
+    p.add_argument("--pipeline-csv", type=Path, default=None, help="From benchmark_gpu_pipeline.py.")
     p.add_argument("--phase", default="train", help="Phase for the CPU-vs-GPU comparison.")
+    p.add_argument("--peak-fp64-gflops", type=float, default=None,
+                   help="FP64 peak for the roofline compute ceiling (e.g. ~4200 for a100_3g.20gb).")
+    p.add_argument("--peak-bw-gbs", type=float, default=None,
+                   help="HBM bandwidth ceiling; default = measured value in the pipeline CSV.")
     p.add_argument("--out-dir", required=True, type=Path, help="Directory for PNG plots.")
     p.add_argument("--md-out", required=True, type=Path, help="Markdown report output.")
     return p
@@ -216,8 +345,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = build_parser().parse_args(argv)
-    if args.kernel_csv is None and args.scaling_csv is None:
-        raise SystemExit("provide at least one of --kernel-csv / --scaling-csv")
+    if args.kernel_csv is None and args.scaling_csv is None and args.pipeline_csv is None:
+        raise SystemExit("provide at least one of --kernel-csv / --scaling-csv / --pipeline-csv")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
@@ -227,12 +356,21 @@ def main(argv: list[str] | None = None) -> int:
         kt = kernel_tables(pd.read_csv(args.kernel_csv))
         written += plot_kernel(kt, args.out_dir)
 
+    pt = None
+    if args.pipeline_csv is not None:
+        pt = pipeline_tables(pd.read_csv(args.pipeline_csv))
+        written += plot_pipeline_curves(pt, args.out_dir)
+        written += plot_roofline(
+            pt, args.out_dir,
+            peak_fp64_gflops=args.peak_fp64_gflops, peak_bw_gbs=args.peak_bw_gbs,
+        )
+
     cg = None
     if args.scaling_csv is not None:
         cg = cpu_vs_gpu(pd.read_csv(args.scaling_csv), phase=args.phase)
         written += plot_cpu_vs_gpu(cg, args.out_dir)
 
-    write_markdown(kt, cg, args.md_out)
+    write_markdown(kt, cg, args.md_out, pt, peak_fp64_gflops=args.peak_fp64_gflops)
     log.info("[analyze-gpu] wrote %s plot(s) -> %s", len(written), args.out_dir)
     return 0
 

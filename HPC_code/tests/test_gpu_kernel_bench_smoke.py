@@ -61,3 +61,8 @@ def test_kernel_benchmark_csv(tmp_path):
         assert float(r["fits_per_s"]) > 0
         assert float(r["kernel_ms_median"]) > 0
         assert int(r["num_regs"]) > 0
+        assert float(r["gflops"]) > 0
+        assert float(r["t_per_fit_us"]) > 0
+        assert float(r["ai_flop_per_byte"]) == pytest.approx(
+            bk.FLOPS_PER_FIT / bk.BYTES_PER_FIT, abs=1e-3
+        )

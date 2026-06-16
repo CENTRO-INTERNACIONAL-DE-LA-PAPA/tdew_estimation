@@ -101,7 +101,8 @@ class AnomalyTrainingConfig:
     td_var:
         Variable name for dewpoint parquet folder (default 'td').
     tmin_var:
-        Variable name for tmin parquet folder (default 'tmin_v1').
+        Variable name for tmin parquet folder (default 'tmin_v12' = PISCOt v1.2 TMIN; use
+        'tmin_v11' for the PISCOt v1.1 TMIN comparison run).
     train_year_range:
         Inclusive year range (start_year, end_year) used for training.
         This is used to select parquet months.
@@ -116,7 +117,7 @@ class AnomalyTrainingConfig:
 
     base_path: Path
     td_var: str = "td"
-    tmin_var: str = "tmin_v1"
+    tmin_var: str = "tmin_v12"
     train_year_range: Tuple[int, int] = (1981, 2016)
     h: int = 11
     kernel: str = "Tricube"

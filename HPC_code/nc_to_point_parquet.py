@@ -28,7 +28,7 @@ CRS assumption can be checked *before* overwriting good data.
 Example::
 
     python HPC_code/nc_to_point_parquet.py \
-        --var tmin --nc-dir /data/_raw/tmin \
+        --var tmin_v11 --nc-dir /data/_raw/tmin_v11 \
         --base /media/ppalacios/Data/henry_simcast_peru \
         --shp  /media/.../PotatoZonning/CENAGRO_OnlyPotatoes_Pisco_Altitude.shp \
         --peru-potato
@@ -73,9 +73,15 @@ def open_pisco(nc_dir: Path, *, chunk_time: int = 31):
     """
     import xarray as xr
 
-    files = sorted(p for p in nc_dir.rglob("*.nc") if p.is_file())
+    # Skip the long-term-mean climatology files (e.g. tmin_mean_1981-2010.nc) bundled with
+    # each PISCO article — they have no daily time axis and would break the time grouping.
+    files = sorted(
+        p
+        for p in nc_dir.rglob("*.nc")
+        if p.is_file() and "mean" not in p.name.lower()
+    )
     if not files:
-        raise FileNotFoundError(f"no .nc files under {nc_dir}")
+        raise FileNotFoundError(f"no daily .nc files under {nc_dir}")
     if len(files) == 1:
         ds = xr.open_dataset(files[0], chunks={})
     else:

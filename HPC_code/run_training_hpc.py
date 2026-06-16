@@ -103,7 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Training config
     p.add_argument("--td-var", default="td")
-    p.add_argument("--tmin-var", default="tmin_v1")
+    p.add_argument("--tmin-var", default="tmin_v12")  # PISCOt v1.2 TMIN; use tmin_v11 for v1.1
     p.add_argument("--train-start", type=int, default=1981)
     p.add_argument("--train-end", type=int, default=2016)
     p.add_argument("--h", type=int, default=11)

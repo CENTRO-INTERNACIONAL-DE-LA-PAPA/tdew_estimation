@@ -50,8 +50,12 @@ def test_constant_bias_metrics(tmp_path):
     assert o["mae"] == pytest.approx(BIAS, abs=1e-9)   # constant positive error
     assert o["rmse"] == pytest.approx(BIAS, abs=1e-9)
     assert o["pearson_r"] == pytest.approx(1.0, abs=1e-9)
+    # pred = obs + BIAS (collinear-ish positive vectors) -> cosine very close to 1.
+    assert o["cosine"] == pytest.approx(1.0, abs=1e-2)
+    assert o["cosine"] <= 1.0 + 1e-9
     # monthly covers Jan–Mar (90 days from Jan 1); each month's bias == BIAS.
     assert (res["monthly"]["bias"] - BIAS).abs().max() == pytest.approx(0.0, abs=1e-9)
+    assert "cosine" in res["monthly"].columns
 
 
 def test_two_runs_picks_lower_rmse(tmp_path):

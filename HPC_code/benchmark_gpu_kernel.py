@@ -23,7 +23,12 @@ fine for timing.
 
 CSV schema (one row per measured point)::
 
-    study, block, M, reps, kernel_ms_median, kernel_ms_min, fits_per_s, num_regs, gpu
+    study, block, M, reps, kernel_ms_median, kernel_ms_min, fits_per_s, t_per_fit_us,
+    flops_per_fit, bytes_per_fit, gflops, ai_flop_per_byte, num_regs, gpu
+
+``gflops`` and ``ai_flop_per_byte`` come from a documented analytic FLOP/byte model
+(``FLOPS_PER_FIT`` / ``BYTES_PER_FIT``); AI ≈ 0.61 places the kernel firmly in the
+memory-bound regime of the A100 roofline.
 
 Example::
 
@@ -54,6 +59,18 @@ import gpu_train  # noqa: E402
 
 log = logging.getLogger("benchmark_gpu_kernel")
 
+# --- FLOP / byte model for ONE solve5 fit (F = 5, float64) ----------------------------
+# Analytic op count of the in-register path (sqrt and div counted as 1 FLOP each):
+#   Cholesky 5x5 ............ ~55   (incl. 5 sqrt)
+#   forward solve  L z = b .. ~25
+#   backward solve Lᵀβ = z .. ~25
+#   weighted R² (Aβ, dots) .. ~77
+# The exact constant is not critical: the conclusion (low AI -> memory-bound) is robust.
+FLOPS_PER_FIT = 182
+# DRAM traffic per fit: read A[25]+b[5]+syy[1] = 31 doubles (248 B); write β[5]+r²[1] = 6
+# doubles (48 B) -> 296 B. AI = 182/296 ≈ 0.61 FLOP/byte (well below the A100 ridge ~5).
+BYTES_PER_FIT = 296
+
 CSV_COLUMNS = [
     "study",
     "block",
@@ -62,6 +79,11 @@ CSV_COLUMNS = [
     "kernel_ms_median",
     "kernel_ms_min",
     "fits_per_s",
+    "t_per_fit_us",
+    "flops_per_fit",
+    "bytes_per_fit",
+    "gflops",
+    "ai_flop_per_byte",
     "num_regs",
     "gpu",
 ]
@@ -130,6 +152,7 @@ def run(args: argparse.Namespace) -> list[dict]:
     rows: list[dict] = []
 
     def _row(study: str, block: int, m: int, med: float, mn: float) -> dict:
+        sec = med / 1000.0
         return {
             "study": study,
             "block": block,
@@ -137,7 +160,12 @@ def run(args: argparse.Namespace) -> list[dict]:
             "reps": args.reps,
             "kernel_ms_median": round(med, 6),
             "kernel_ms_min": round(mn, 6),
-            "fits_per_s": round(m / (med / 1000.0), 1) if med > 0 else float("nan"),
+            "fits_per_s": round(m / sec, 1) if med > 0 else float("nan"),
+            "t_per_fit_us": round(sec * 1e6 / m, 6) if m > 0 else float("nan"),
+            "flops_per_fit": FLOPS_PER_FIT,
+            "bytes_per_fit": BYTES_PER_FIT,
+            "gflops": round(FLOPS_PER_FIT * m / sec / 1e9, 3) if med > 0 else float("nan"),
+            "ai_flop_per_byte": round(FLOPS_PER_FIT / BYTES_PER_FIT, 4),
             "num_regs": num_regs,
             "gpu": gpu,
         }

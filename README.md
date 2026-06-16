@@ -103,7 +103,7 @@ There is no installed console script; you run Python modules/scripts directly.
 
 #### 0) Define paths once (bash variables)
 ```bash
-BASE="/path/to/base"                 # contains td/Outputs and tmin_v1/Outputs
+BASE="/path/to/base"                 # contains td/Outputs, tmin_v11/Outputs (PISCOt v1.1) and tmin_v12/Outputs (v1.2)
 RESULTS="/path/to/results"           # where you will write outputs
 GRID="/path/to/grid.dbf"             # grid file defining IDs (dbf/shp/gpkg/geojson/csv/parquet)
 
@@ -129,7 +129,7 @@ calculate_and_save_climatology_chunked(
     base_path=Path("'"${BASE}"'"),
     output_file=Path("'"${CLIM}"'"),
     td_var="td",
-    tmin_var="tmin_v1",
+    tmin_var="tmin_v12",
     outputs_subdir="Outputs",
     engine="pyarrow",
     cleanup=True,
@@ -157,7 +157,7 @@ build_bucketed_training_dataset(
     base_path=Path("'"${BASE}"'"),
     output_dir=Path("'"${PREPARED}"'"),
     td_var="td",
-    tmin_var="tmin_v1",
+    tmin_var="tmin_v12",
     outputs_subdir="Outputs",
     num_buckets=1024,
     overwrite=False,
@@ -190,7 +190,7 @@ from tdew_estimation.anomaly_dask import DaskAnomalyConfig, run_bucketed_anomaly
 cfg = AnomalyTrainingConfig(
     base_path=Path("'"${BASE}"'"),
     td_var="td",
-    tmin_var="tmin_v1",
+    tmin_var="tmin_v12",
     train_year_range=(1981, 2016),
     h=11,
     kernel="Tricube",
@@ -269,7 +269,7 @@ print("DOYS_TO_FIX =", doys_to_fix)
 cfg = AnomalyTrainingConfig(
     base_path=Path("'"${BASE}"'"),
     td_var="td",
-    tmin_var="tmin_v1",
+    tmin_var="tmin_v12",
     train_year_range=(1981, 2016),
     h=11,
     kernel="Tricube",
@@ -453,7 +453,7 @@ The `run_bucketed_anomaly_training_dask(...)` function is designed so that the o
 ### Inputs (time series)
 For each grid cell `ID` and date `FECHA`, the pipeline expects daily parquet inputs for:
 - `td`  (dewpoint) stored as `Value` → renamed to `TD`
-- `tmin_v1` (minimum temperature) stored as `Value` → renamed to `TMIN`
+- `tmin_v12` (minimum temperature, PISCOt v1.2; or `tmin_v11` for v1.1) stored as `Value` → renamed to `TMIN`
 
 Required columns in the parquet inputs:
 - `ID` (grid cell / location identifier)
@@ -462,7 +462,7 @@ Required columns in the parquet inputs:
 
 Typical monthly file convention used by the original pipeline:
 - `{base_path}/td/Outputs/td_daily_YYYY_MM.parquet`
-- `{base_path}/tmin_v1/Outputs/tmin_daily_YYYY_MM.parquet` (legacy naming)
+- `{base_path}/tmin_v12/Outputs/tmin_v12_daily_YYYY_MM.parquet`
   - also supports `{variable}_daily_YYYY_MM.parquet`
 
 ### Step 1 — Daily climatology per (ID, doy)

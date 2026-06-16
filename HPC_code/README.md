@@ -1,180 +1,191 @@
-# HPC_code — SLURM / GPU scaling for TDEW estimation
+# HPC_code — run TDEW on SLURM / GPU
 
-This folder holds everything specific to running the TDEW pipeline on the university
-HPC (SLURM, CPU multi-node) and on A100 GPUs, plus the benchmark harness for the
-scaling experiments described in `tdew_estimation_pram.qmd`. Local single-machine
-execution lives in [`../Local/`](../Local/); the shared algorithm/library lives in the
-`tdew_estimation` package and is used unchanged by both.
+This folder runs the TDEW pipeline on a cluster (SLURM, CPU multi-node) or a GPU, plus the
+benchmark harness for the scaling study in `tdew_estimation_pram.qmd`. Local single-machine
+execution lives in [`../Local/`](../Local/); the shared algorithm lives in the `tdew_estimation`
+package and is used unchanged by both.
 
-The key design hook: the bucketed runners
-(`run_bucketed_anomaly_training_dask`, `run_bucketed_forecast_dask`) accept an injected
-Dask `client`. This folder only supplies different **clusters** — the work `W` and the
-outputs are identical; only the parallel-processor count `P` changes.
+**The whole workflow is four steps:** _install_ → _get the data_ → _prep once_ → then pick a
+goal: **[A] Train the model** (get coefficients you can use) or **[B] Benchmark** (does it scale,
+and which PISCOt version predicts dewpoint better). Steps 1–2 are shared; A and B are independent.
 
-## Layout
+## Workflow at a glance
+
+```mermaid
+flowchart TD
+    I["1. Install deps + mkdir logs"] --> D{"Get data:<br/>which points?"}
+    D -->|"potato ~302k (default)"| BASE["BASE = henry_simcast_peru"]
+    D -->|"whole PISCO ~2M"| BASEF["BASE = pisco_full<br/>(download_data.sh PERU_POTATO=0)"]
+    BASE --> PREP["2. Prep — once per version<br/>sbatch prep_inputs.sbatch<br/>→ bucketed inputs under results_v11 / results_v12"]
+    BASEF --> PREP
+    PREP --> GOAL{"What do you want?"}
+
+    GOAL -->|"A. Train"| TRAIN["sbatch train_cpu.sbatch (P=32, FORECAST=1)<br/>or train_gpu_a100.sbatch"]
+    TRAIN --> MODEL["coefficients per (ID, doy) = the model<br/>(+ predictions/)"]
+
+    GOAL -->|"B. Benchmark"| BENCH{"Benchmark what?"}
+    BENCH -->|"B.1 scaling"| SC["MODE=benchmark train_cpu.sbatch<br/>strong + weak"] --> ASC["analyze_scaling.py<br/>→ S(p), E(p) tables + plots"]
+    BENCH -->|"B.2 GPU"| GP["MODE=benchmark train_gpu_a100.sbatch<br/>kernel + pipeline roofline"] --> AGP["analyze_gpu.py<br/>→ roofline, curves, CPU-vs-GPU"]
+    BENCH -->|"B.3 v1.1 vs v1.2"| CMP["train + forecast BOTH versions"] --> EV["evaluate_accuracy + compare_datasets<br/>→ which predicts TDEW better (RMSE/cosine)"]
+```
+
+Every box is a `python`/`sbatch` command from the steps below. The cluster builders in `hpc.py`
+inject a Dask `client` (`local`/`slurm`/`cuda`) into the *same* runners, so the work and outputs
+are identical — only the processor count `P` changes.
+
+## What's here
 
 | File | Purpose |
 |------|---------|
 | `hpc.py` | Cluster builders: `make_slurm_cluster` (dask-jobqueue), `make_local_cuda_cluster` (dask-cuda), `make_local_cpu_cluster` (baseline / `P=1`). Each returns a live `Client`. |
-| `run_training_hpc.py` | Entrypoint: build `local\|slurm\|cuda` cluster → inject client → run TRAIN-COEFFICIENTS (+ optional FORECAST). Reuses the package runners. |
-| `sbatch/train_cpu.sbatch` | SLURM driver job for CPU strong/weak scaling (placeholders for partition/account). |
-| `sbatch/train_gpu_a100.sbatch` | SLURM driver job for A100 runs (`--gres=gpu:a100:N`, `P` = #GPUs). |
-| `requirements-gpu.txt` | Optional GPU/HPC deps (cu12 wheels + dask-jobqueue). |
-| `benchmark_scaling.py` | D4 driver: fresh cluster per `(p, trial)` → time the injected-client runners → append timing rows to a CSV. |
-| `analyze_scaling.py` | D4 analysis: median over trials → speedup `S(p)`/efficiency `E(p)` → markdown tables + PNG plots. |
 | `nc_to_point_parquet.py` | Extract PISCOt `.nc` rasters → per-point monthly parquet (Python/xarray port of the R/`terra` step). Potato-points or full-grid via `--peru-potato`. |
-| `prep_inputs.py` | **Phase 0**: build the reusable bucketed inputs (climatology, bucket-year dataset, climatology/future-TMIN shards) — *no training*. Run once per dataset version. |
-| `benchmark_gpu_pipeline.py` | Single-GPU **roofline** of the full bucket path (assemble/convolve/solve): per-stage GFLOPS + arithmetic intensity, swept over N=IDs/bucket. |
-| `sbatch/download_data.sh` | Download the 3 figshare PISCOt products (`.nc`) and run the extractor per variable. Resume-safe, idempotent, `BASE`/`VARS`-overridable. |
-| `_synth.py` | Tiny synthetic raw dataset generator (runs the real prep pipeline) for smoke tests. |
-| `tests/test_benchmark_smoke.py` | RAPIDS-free pytest smoke for the benchmark + analysis flow. |
+| `sbatch/download_data.sh` | Download the 3 figshare PISCOt products (`.nc`) and run the extractor per variable. Resume-safe, idempotent. |
+| `prep_inputs.py` / `sbatch/prep_inputs.sbatch` | **Step 2 (prep)**: build the reusable bucketed inputs (climatology, bucket-year dataset, shards) — *no training_. `--n-workers` parallelises it. |
+| `run_training_hpc.py` | Train entrypoint: build `local\|slurm\|cuda` cluster → train coefficients (+ optional forecast). |
+| `sbatch/train_cpu.sbatch` | CPU driver job — `MODE=train` (one run) or `MODE=benchmark` (scaling sweep). |
+| `sbatch/train_gpu_a100.sbatch` | Single-GPU driver job (one A100 / MIG slice; `client=None`, no dask-cuda) — `MODE=train\|benchmark`. |
+| `benchmark_scaling.py` | Scaling driver: fresh cluster per `(p, trial)` → time the runners → append timing rows to a CSV. |
+| `benchmark_gpu_kernel.py` / `benchmark_gpu_pipeline.py` | Single-GPU kernel + full-pipeline **roofline** (GFLOPS, arithmetic intensity). |
+| `analyze_scaling.py` / `analyze_gpu.py` | Turn the CSVs into markdown tables + PNG plots (speedup/efficiency; roofline / CPU-vs-GPU). |
+| `evaluate_accuracy.py` / `compare_datasets.py` | Score forecast skill vs observed `TD` and compare two PISCOt versions (RMSE/MAE/bias/Pearson r/cosine). |
+| `requirements-gpu.txt` | Optional GPU deps (cu12 wheels + dask-jobqueue). |
+| `_synth.py` / `tests/` | Synthetic dataset generator + pytest smoke tests (`pytest HPC_code`). |
 
-## Data preparation: PISCO `.nc` → point parquet
+---
 
-The raw climate inputs are PISCOt `.nc` rasters; the pipeline consumes per-point monthly
-parquet (`{base}/{var}/Outputs/{var}_daily_YYYY_MM.parquet`, columns `ID,FECHA,Value`).
-`nc_to_point_parquet.py` is the headless Python/xarray port of the legacy R/`terra`
-extraction — verified to reproduce the existing parquet **bit-for-bit** (`max|Δ|=0`).
+# 1. Setup (once)
+
+**Install** (pick the extras you need):
 
 ```bash
-pip install -e .[netcdf]                  # xarray + netCDF4 (geopandas already in core)
-
-# Download all three products and extract at the potato-zoning centroids (~302k points):
-bash HPC_code/sbatch/download_data.sh                 # BASE/VARS/PERU_POTATO/PURGE_RAW overridable
-
-# Full PISCO grid (~2M points, heavier benchmark workload):
-PERU_POTATO=0 bash HPC_code/sbatch/download_data.sh
-
-# Safety gate — diff a fresh extraction against existing data before overwriting (no writes):
-python HPC_code/nc_to_point_parquet.py --var tmin_v11 --nc-dir <dir-with-one-.nc> \
-    --base "$BASE" --shp "$BASE/PotatoZonning/CENAGRO_OnlyPotatoes_Pisco_Altitude.shp" \
-    --peru-potato --verify-against-existing
+pip install -e .[hpc]                                    # SLURM (dask-jobqueue)
+pip install -e .[netcdf]                                 # only if you extract .nc yourself
+pip install -e .[benchmark]                              # matplotlib, for the analyze_* plots
+pip install --extra-index-url=https://pypi.nvidia.com \
+    -r HPC_code/requirements-gpu.txt                     # GPU (Linux, CUDA 12.x)
+mkdir -p logs    # REQUIRED: SLURM opens logs/*.out before the job body runs
 ```
 
-`--peru-potato` (default) samples each daily layer at the CENAGRO potato centroids (the
-science subset, `ID` = shapefile feature order); `--no-peru-potato` keeps the full grid
-(`ID` = row-major `(lat,lon)`, plus a `grid_index.parquet`).
-
-Version-explicit folders (the older local `tmin`/`tmin_v1` folders were labeled *opposite*
-to their real PISCOt version — confirmed bit-for-bit against figshare). Source→variable map:
-`tmin_v11`←PISCOt v1.1 TMIN (16372509, 1981–2016), `tmin_v12`←PISCOt v1.2 TMIN (20533715 v2,
-1981–2020), `td`←PISCOt v1.1 TDEW (16305341, 1981–2016). The v11-vs-v12 comparison overlaps
-1981–2016.
-
-## Dataset choice: potato-only vs whole PISCO
-
-Every command below operates on whatever lives under `--base`. **Which points** are in the
-data is fixed when it is *extracted* (`sbatch/download_data.sh`), not later:
+**Get the data.** Which *points* you run on is fixed when the data is extracted — pick `BASE`:
 
 ```bash
-# Potato planting zones only (~302k points) — the default, already extracted:
+# Potato planting zones only (~302k points) — the science target, already extracted on the dev box:
 export BASE=/media/ppalacios/Data/henry_simcast_peru
 
-# OR the whole PISCO grid (~2M points) — extract ONCE into a SEPARATE base (so it does not
-# overwrite the potato data), then point everything at it:
+# OR the whole PISCO grid (~2M points, ~6.6× the work) — extract ONCE into a SEPARATE base:
 PERU_POTATO=0 BASE=/media/ppalacios/Data/pisco_full bash HPC_code/sbatch/download_data.sh
 export BASE=/media/ppalacios/Data/pisco_full
 ```
 
-The whole-grid run is ~6.6× the work (heavier scaling workload); the potato subset is the
-science target. Pick `BASE` accordingly — nothing else changes.
+Everything below operates on whatever `BASE` points at — nothing else changes between the two.
 
-## Phase 0: prep the bucketed inputs (run once per version)
+# 2. Prep the data — once per dataset version (needed for BOTH goals)
 
-`run_training_hpc.py` / `benchmark_scaling.py` run only the **compute** phases; they assume
-the bucketed inputs already exist under `--results`. Build them once per dataset version with
-`prep_inputs.py` (no training):
-
-```bash
-mkdir -p logs
-# PISCOt v1.1:
-python HPC_code/prep_inputs.py --base "$BASE" --results results_v11 \
-    --td-var td --tmin-var tmin_v11 --train-start 1981 --train-end 2016 \
-    --pred-start 2017 --pred-end 2020 --num-buckets 1024
-# PISCOt v1.2:
-python HPC_code/prep_inputs.py --base "$BASE" --results results_v12 \
-    --td-var td --tmin-var tmin_v12 --train-start 1981 --train-end 2016 \
-    --pred-start 2017 --pred-end 2020 --num-buckets 1024
-```
-
-This writes under each `results_*/`: `daily_climatology.parquet`, `bucketed_training_data/`,
-`climatology_by_bucket/`, `future_tmin_by_bucket/`. **The dataset version is baked in here**
-(via `--tmin-var`); downstream jobs just point at `--results`. Use `--num-buckets 1024` so
-`B ≥ 4·p_max` for the CPU scaling sweep.
-
-`--n-workers` parallelises the dominant **bucket-year build** (one process per training year;
-identical output, only faster — climatology/shards stay sequential). On KHIPU submit it as a
-batch job on `standard` (it auto-uses `--n-workers $SLURM_CPUS_PER_TASK`):
+Prep pays the expensive `TD`↔`TMIN` merge **once** and reshapes the data into compact per-bucket
+files, so training/benchmarking just read them. It produces `daily_climatology.parquet`,
+`bucketed_training_data/`, `climatology_by_bucket/`, `future_tmin_by_bucket/` under `--results`.
+**The dataset version is chosen here** (via `--tmin-var`); downstream jobs only point at `--results`.
 
 ```bash
-mkdir -p logs
+# PISCOt v1.1 and v1.2 into separate result roots (one process per training year):
 BASE="$BASE" RESULTS=results_v11 TMIN_VAR=tmin_v11 sbatch HPC_code/sbatch/prep_inputs.sbatch
 BASE="$BASE" RESULTS=results_v12 TMIN_VAR=tmin_v12 sbatch HPC_code/sbatch/prep_inputs.sbatch
 ```
 
-## Runbook A — prep → benchmark → results
+(Direct, no SLURM: `python HPC_code/prep_inputs.py --base "$BASE" --results results_v12
+--tmin-var tmin_v12 --train-start 1981 --train-end 2016 --pred-start 2017 --pred-end 2020
+--num-buckets 1024 --n-workers 32`. Use `--num-buckets 1024` so `B ≥ 4·p_max` for the CPU sweep.)
 
-Measure scaling/throughput (re-uses the Phase-0 `results_v11`; swap to `results_v12` for v1.2):
+---
+
+# A. Train the model
+
+**Use this when you want the model itself.** Training fits, for every location `ID` and every
+day-of-year, a small weighted regression of the `TD` anomaly on `TMIN` — the output is a table of
+**coefficients per `(ID, doy)`** (`const_anom, TMIN_anom_coeff, TD_anom_lag1, TD_anom_lag2,
+TMIN_anom_lag1, r_squared_anom`). That table *is* the fitted model: anyone can apply it to a new
+`TMIN` series to estimate dewpoint. It trains on the **whole** dataset (all IDs, full years).
 
 ```bash
-# CPU strong + weak scaling (KHIPU: standard/postgrado preset in the sbatch).
-MODE=benchmark BASE="$BASE" RESULTS=results_v11 DATASET_LABEL=v11 \
+# CPU (multi-node fleet, P=32 workers) + forecast future TD:
+BASE="$BASE" RESULTS=results_v12 P=32 FORECAST=1 sbatch HPC_code/sbatch/train_cpu.sbatch
+
+# OR the single GPU (much faster for the fit; same numbers):
+BASE="$BASE" RESULTS=results_v12 FORECAST=1 sbatch HPC_code/sbatch/train_gpu_a100.sbatch
+```
+
+**Outputs** under `results_v12/`: `llr_coeffs_anomaly_dataset/id_bucket=XXXX/coeffs.parquet`
+(the model) and — with `FORECAST=1` — `predictions/` (+ combined `td_predictions.parquet`).
+Use `results_v11` for v1.1. (`FORECAST` is optional; drop it if you only need coefficients.)
+
+---
+
+# B. Benchmark
+
+Benchmarking answers two questions: **(B.1–B.2) does the pipeline get faster with more hardware**,
+and **(B.3) which PISCOt version predicts dewpoint better**. Each block below says what it measures.
+
+## B.1 — Does it scale? (CPU strong & weak scaling)
+
+**What this measures.** For a phase timed at `p` workers we report execution time `T(p)`, **speedup**
+`S(p) = T(1)/T(p)` ("how many × faster with `p` workers"), and **efficiency** `E(p) = S(p)/p`
+("what fraction of each worker was useful"; ideal = 1). *Strong* scaling fixes the problem and adds
+workers — _"can the cluster finish this sooner?"_ *Weak* scaling grows the problem with the workers
+(`n(p) = n0·p`) — _"if we double both, does the time stay flat?"_ Speedup is expected to rise while
+`p ≤ B` (bucket count) then flatten.
+
+```bash
+# strong scaling
+MODE=benchmark BASE="$BASE" RESULTS=results_v12 DATASET_LABEL=v12 \
     P_LIST=1,2,4,8,16,32 TRIALS=3 NUM_BUCKETS=1024 \
-    sbatch HPC_code/sbatch/train_cpu.sbatch                       # -> results_v11/scaling_cpu_v11.csv
-MODE=benchmark BENCH_MODE=weak BASE="$BASE" RESULTS=results_v11 DATASET_LABEL=v11 \
-    P_LIST=1,2,4,8,16,32 N0=4 sbatch HPC_code/sbatch/train_cpu.sbatch   # appends weak rows
-
-# GPU roofline (kernel + full-pipeline) + single-GPU end-to-end point (KHIPU: gpu/ag001/MIG).
-MODE=benchmark BASE="$BASE" RESULTS=results_v11 DATASET_LABEL=v11 \
-    sbatch HPC_code/sbatch/train_gpu_a100.sbatch
-    # -> results_v11/{gpu_kernel.csv, gpu_pipeline.csv, scaling_gpu.csv}
-
-# Turn the CSVs into tables + plots:
-python HPC_code/analyze_scaling.py --csv results_v11/scaling_cpu_v11.csv \
-    --out-dir results_v11/cpu_plots --md-out results_v11/cpu_tables.md
-python HPC_code/analyze_gpu.py --kernel-csv results_v11/gpu_kernel.csv \
-    --pipeline-csv results_v11/gpu_pipeline.csv --scaling-csv results_v11/scaling_gpu.csv \
-    --peak-fp64-gflops 4200 --out-dir results_v11/gpu_plots --md-out results_v11/gpu_report.md
-```
-
-**Where the results land** (under `results_v11/`):
-- CSVs: `scaling_cpu_v11.csv` (CPU strong+weak), `gpu_kernel.csv`, `gpu_pipeline.csv`, `scaling_gpu.csv`.
-- CPU tables/plots: `cpu_tables.md` + `cpu_plots/` (`speedup_*`, `efficiency_*`, `time_*`.png).
-- GPU report/plots: `gpu_report.md` + `gpu_plots/` (`gpu_roofline.png`, `gpu_pipeline_*_vs_M.png`,
-  `gpu_block_tuning.png`, `gpu_throughput.png`, `cpu_vs_gpu.png`).
-
-(For the GPU roofline ceiling, confirm the MIG slice's FP64 peak / HBM BW on `ag001`;
-`benchmark_gpu_pipeline.py` also measures bandwidth empirically.)
-
-## Runbook B — prep → train on the data
-
-Produce the actual coefficients (+ optional forecast), not a benchmark:
-
-```bash
-# CPU multi-node training at P=32, with forecast:
-BASE="$BASE" RESULTS=results_v11 P=32 FORECAST=1 \
     sbatch HPC_code/sbatch/train_cpu.sbatch
+# weak scaling
+MODE=benchmark BENCH_MODE=weak BASE="$BASE" RESULTS=results_v12 DATASET_LABEL=v12 \
+    P_LIST=1,2,4,8,16,32 N0=4 sbatch HPC_code/sbatch/train_cpu.sbatch
 
-# OR train on the single GPU (client=None, no dask-cuda):
-BASE="$BASE" RESULTS=results_v11 FORECAST=1 \
-    sbatch HPC_code/sbatch/train_gpu_a100.sbatch
+python HPC_code/analyze_scaling.py --csv results_v12/scaling_cpu_v12.csv \
+    --out-dir results_v12/cpu_plots --md-out results_v12/cpu_tables.md
 ```
 
-**Outputs** (under `results_v11/`): `llr_coeffs_anomaly_dataset/` (fitted coefficients per
-bucket) and, with `FORECAST=1`, `predictions/` (+ combined `td_predictions.parquet`). Swap
-`results_v11`→`results_v12` to train on v1.2. For a single dev box, add `CLUSTER=local`.
+→ `results_v12/cpu_tables.md` (T, S, E tables) + `cpu_plots/` (`speedup_*`, `efficiency_*`, `time_*`.png).
 
-## Runbook C — compare PISCOt v1.1 vs v1.2 (science)
+## B.2 — How fast is the GPU? (roofline)
 
-This is a **held-out skill** comparison, *not* a benchmark: train both TMIN versions on a
-window, forecast a *withheld* window, and score the forecasts against observed `TD`. The
-withheld window must have observed `td` **and** future TMIN for **both** versions, so it must
-lie inside the v1.1 range — use e.g. train **1981–2014**, forecast **2015–2016** (1981–2016 is
-the v11∩v12 overlap). Prep with that split (own result roots so production runs aren't
-clobbered):
+**What this measures.** The GPU does the fit in three stages — **assemble** (build the per-`(ID,doy)`
+5×5 normal equations), **convolve** (the day-of-year window), **solve** (batched 5×5 Cholesky). For
+each we report time, throughput (fits/s), achieved **GFLOPS**, and **arithmetic intensity**
+`AI = FLOPs/byte`, swept over problem size `M = #fits` with one curve per `N = IDs/bucket`. The
+**roofline** plots achieved GFLOPS against AI with the device's compute and memory-bandwidth
+ceilings: our AI (~0.1–0.6) sits far left of the ridge, so the pipeline is **memory-bandwidth
+bound** — speed comes from HBM bandwidth and batch width, not FP64 throughput. KHIPU has one A100
+MIG slice, so there is no multi-GPU sweep; this *is* the single-GPU performance story.
 
 ```bash
-# Phase 0 with a held-out split, per version:
+# one job runs the kernel sweep + full-pipeline roofline + the single-GPU end-to-end point:
+MODE=benchmark BASE="$BASE" RESULTS=results_v12 DATASET_LABEL=v12 \
+    sbatch HPC_code/sbatch/train_gpu_a100.sbatch
+    # -> results_v12/{gpu_kernel.csv, gpu_pipeline.csv, scaling_gpu.csv}
+
+python HPC_code/analyze_gpu.py --kernel-csv results_v12/gpu_kernel.csv \
+    --pipeline-csv results_v12/gpu_pipeline.csv --scaling-csv results_v12/scaling_gpu.csv \
+    --peak-fp64-gflops 4200 --out-dir results_v12/gpu_plots --md-out results_v12/gpu_report.md
+```
+
+→ `gpu_report.md` + `gpu_plots/` (`gpu_roofline.png`, `gpu_pipeline_*_vs_M.png`,
+`gpu_block_tuning.png`, `gpu_throughput.png`, `cpu_vs_gpu.png`). Confirm the MIG slice's FP64 peak /
+HBM bandwidth on the real device — the benchmark also measures bandwidth empirically.
+
+## B.3 — Which PISCOt version predicts TDEW better? (v1.1 vs v1.2)
+
+**What this measures.** Benchmarking the *data's* predictive quality, not speed. We train both TMIN
+versions on a window, **forecast a withheld window**, and score the predicted `TD` against the
+**observed** `TD`: RMSE, MAE, bias (pred−obs), Pearson `r`, and **cosine similarity** (the metric the
+inspiring paper used). The lower-RMSE version forecasts dewpoint better. The withheld window must
+have observed `td` *and* future `TMIN` for **both** versions, so it lies inside the v1.1∩v1.2 overlap
+(**1981–2016**) — e.g. train 1981–2014, forecast 2015–2016.
+
+```bash
+# prep BOTH versions with the held-out split (separate roots so production runs aren't touched):
 for V in v11 v12; do
   python HPC_code/prep_inputs.py --base "$BASE" --results cmp_$V \
       --td-var td --tmin-var tmin_$V \
@@ -182,131 +193,89 @@ for V in v11 v12; do
       --num-buckets 1024 --n-workers 32        # or: sbatch sbatch/prep_inputs.sbatch
 done
 
-# Train + FORECAST both (forecast is required — predictions are what gets scored):
+# train + FORECAST both (forecast is required — predictions are what gets scored):
 BASE="$BASE" RESULTS=cmp_v11 P=32 FORECAST=1 sbatch HPC_code/sbatch/train_cpu.sbatch
 BASE="$BASE" RESULTS=cmp_v12 P=32 FORECAST=1 sbatch HPC_code/sbatch/train_cpu.sbatch
 
-# 1) Skill vs OBSERVED td — RMSE / MAE / bias / Pearson r / cosine, v1.1 vs v1.2:
+# 1) skill vs OBSERVED td — which version forecasts TD better:
 python HPC_code/evaluate_accuracy.py \
     --pred-a cmp_v11/predictions --pred-b cmp_v12/predictions \
     --obs "$BASE/td/Outputs" --label-a v1.1 --label-b v1.2 \
     --out-dir cmp/plots --md-out cmp/accuracy_v11_v12.md
 
-# 2) How the two models' coefficients + predictions agree (+ cosine):
+# 2) how the two models' coefficients + predictions agree (+ cosine):
 python HPC_code/compare_datasets.py \
     --coeffs-a cmp_v11/llr_coeffs_anomaly_dataset --coeffs-b cmp_v12/llr_coeffs_anomaly_dataset \
     --pred-a cmp_v11/predictions --pred-b cmp_v12/predictions \
     --label-a v1.1 --label-b v1.2 --out-dir cmp/plots --md-out cmp/compare_v11_v12.md
 ```
 
-**Outputs:** `cmp/accuracy_v11_v12.md` (which version forecasts `TD` better — the "Lower RMSE"
-verdict) and `cmp/compare_v11_v12.md` (coefficient/prediction agreement), plus PNGs in
-`cmp/plots/` (residuals, pred-vs-obs, monthly RMSE; Δ-histograms, R² scatter). On a single dev
-box add `CLUSTER=local` to the train jobs. (Runbooks A/B use one version and never forecast for
-scoring; only Runbook C compares versions.)
+→ `cmp/accuracy_v11_v12.md` (the "Lower RMSE" verdict — which version wins) and
+`cmp/compare_v11_v12.md` (coefficient/prediction agreement), plus PNGs in `cmp/plots/`.
 
-## Install
+---
 
-```bash
-pip install -e .[hpc]                                    # base + dask-jobqueue (SLURM)
-pip install --extra-index-url=https://pypi.nvidia.com \
-    -r HPC_code/requirements-gpu.txt                     # + GPU/RAPIDS (Linux, CUDA 12.x)
-```
+# Reference (knobs & internals)
 
-## Run
+## Changing SLURM parameters
+
+Each `sbatch/*.sbatch` file begins with `#SBATCH` directives that request the *driver* job's
+resources. Change them **two ways**: edit the line in the file (permanent for your site), or
+**override at submit time** — a command-line flag beats the file:
 
 ```bash
-mkdir -p logs    # REQUIRED first: SLURM opens logs/*.out before the job body runs
-
-# Baseline P=1 (any machine)
-python HPC_code/run_training_hpc.py --base "$BASE" --results "$RESULTS" \
-    --cluster local --n-workers 1
-
-# CPU multi-node fleet on SLURM (KHIPU: partition standard, account postgrado), P=32:
-BASE=... RESULTS=... P=32 FORECAST=1 sbatch HPC_code/sbatch/train_cpu.sbatch
-
-# Single GPU (KHIPU: one A100 MIG slice, partition gpu/ag001), client=None — no dask-cuda:
-BASE=... RESULTS=... sbatch HPC_code/sbatch/train_gpu_a100.sbatch
+sbatch -p mypartition -A myaccount -c 16 --mem=32G -t 02:00:00 \
+       HPC_code/sbatch/train_cpu.sbatch          # overrides the #SBATCH lines for this run
 ```
 
-The `sbatch/` files are preset for **KHIPU** (`account=postgrado`; CPU `standard`; GPU `gpu`
-node `ag001`, `--gres=gpu:a100_3g.20gb:1`; `cpu=32` / `08:00:00` account limits). Override per
-site on the command line, e.g. `sbatch -p debug ...`. For a single dev box with a local SLURM,
-set `CLUSTER=local` so the CPU job runs on the one node instead of spawning a `dask-jobqueue`
-fleet.
+| `#SBATCH` directive | What it requests | KHIPU default | Override flag |
+|---|---|---|---|
+| `--partition` | the queue | `standard` (CPU) / `gpu` (GPU) | `-p <queue>` |
+| `--account` | billing account | `postgrado` | `-A <account>` |
+| `--cpus-per-task` | cores on the driver node | `32` | `-c <n>` |
+| `--mem` | RAM for the job | `64G` (CPU) / `32G` (GPU) | `--mem=<n>G` |
+| `--gres` | GPUs | `gpu:a100_3g.20gb:1` (GPU job) | `--gres=<spec>` |
+| `--time` | walltime cap | `04:00:00` (KHIPU max `08:00:00`) | `-t <hh:mm:ss>` |
+| `--nodelist` | pin to a node | `ag001` (GPU) | `-w <node>` (or delete the line) |
 
-`--bucket-ids start:end` restricts the run to a deterministic subset of buckets — used
-for weak scaling (`n = n0·p`) and for smoke tests.
+**Driver vs worker fleet.** The `#SBATCH` lines size the **driver** (the one process that runs the
+scheduler + Python). With `--cluster slurm` the actual **worker fleet** is requested *separately* by
+dask-jobqueue and sized by the `--slurm-cores / --slurm-memory / --slurm-walltime` flags inside the
+sbatch body (currently `16` cores / `64GB` / `02:00:00` per worker job) — edit those to change the
+fleet, not the `#SBATCH` block. With `--cluster local` there is no fleet: workers are processes on
+the driver node, bounded by `--cpus-per-task`.
 
-## Benchmarking (D4)
+**Try it locally first.** On a single machine / local SLURM, add `CLUSTER=local` to the CPU jobs
+(runs on one node instead of spawning a dask-jobqueue fleet) and submit with `sbatch -p debug`. A
+local SLURM usually has **no GPU GRES**, so run the GPU benchmark/train *directly* with
+`python HPC_code/...` (or `benchmark_gpu_*` + `run_training_hpc.py --gpu-train`). To rehearse the
+whole flow cheaply, point `BASE` at a small subset of IDs.
 
-`benchmark_scaling.py` produces the scaling CSVs and `analyze_scaling.py` / `analyze_gpu.py`
-turn them into standalone tables + PNG plots. `--hw cpu` sweeps CPU workers; `--hw gpu
---gpu-train` runs the D3 GPU batched-WLS trainer (single GPU with `--cluster local`, `p-list 1`;
-multi-GPU with `--cluster cuda` later). The CSV's `hw` column separates CPU and GPU rows so
-`analyze_gpu.py` can build the CPU-vs-GPU overlay.
+**Cluster backends** (`--cluster`): `local` = single-node `LocalCluster` sized to `p`; `slurm` =
+multi-node `dask-jobqueue` fleet of `p` workers (needs `--slurm-queue`/`--slurm-account`); `cuda` =
+`dask-cuda` (future multi-GPU; not used on KHIPU's single GPU).
 
-Install the (lightweight) plotting extra:
+**sbatch environment variables** (override on the command line):
 
-```bash
-pip install -e .[benchmark]    # matplotlib only
-```
+| Var | Used by | Meaning |
+|---|---|---|
+| `MODE` | train_cpu / train_gpu | `train` (default) or `benchmark` |
+| `CLUSTER` | train_cpu | `slurm` (default) or `local` (single node / testing) |
+| `P` | train_cpu (train) | worker processes for a training run |
+| `P_LIST`, `TRIALS` | *_benchmark | processor counts to sweep; repeats per point |
+| `BENCH_MODE`, `N0` | train_cpu benchmark | `strong` (default) or `weak`; weak base buckets/proc |
+| `NUM_BUCKETS` | benchmark | how many prepped buckets to use (≤ the B you prepped; `≥ 4·max(p)`) |
+| `FORECAST` | train | `1` to also run the forecast phase |
+| `DATASET_LABEL` | benchmark | tag written into the CSV (`v11`/`v12`) |
+| `N_WORKERS`, `TMIN_VAR` | prep_inputs | parallel years; which TMIN version to prep |
+| `SYNTH` | benchmark | build a synthetic dataset first (no real data needed) |
 
-End-to-end synthetic smoke (no real data, no RAPIDS, no SLURM):
+`run_training_hpc.py` does *one* run at a fixed `P`; `benchmark_scaling.py` *sweeps* `P` and writes
+the scaling CSV — they share `train_cpu.sbatch` via `MODE`. The sbatch files are **preset for KHIPU**
+(`account=postgrado`; CPU `standard`; GPU `gpu`/`ag001`/`gpu:a100_3g.20gb:1`; `cpu=32`,
+`08:00:00`); override per site (`sbatch -p <part> -A <acct>`).
 
-```bash
-# Strong scaling on a tiny synthetic dataset built by the REAL prep pipeline.
-python HPC_code/benchmark_scaling.py \
-    --base /tmp/tdew_synth/base --results /tmp/tdew_synth/results \
-    --hw cpu --mode strong --p-list 1,2,4 --trials 1 --num-buckets 8 \
-    --phases train --dataset-label synth --synth \
-    --out-csv /tmp/tdew_synth/scaling.csv
+**Tests:** `pytest HPC_code` (CuPy/RAPIDS-free; GPU tests `importorskip`).
 
-python HPC_code/analyze_scaling.py --csv /tmp/tdew_synth/scaling.csv \
-    --out-dir /tmp/tdew_synth/plots --md-out /tmp/tdew_synth/tables.md
-```
-
-`run_training_hpc.py` and `benchmark_scaling.py` are **different jobs**:
-`run_training_hpc.py` does *one* run at a fixed `P` (production training or a single
-scaling point); `benchmark_scaling.py` *sweeps* `P` over `--p-list`, repeats `--trials`,
-and writes the scaling CSV. They share one SLURM file (`sbatch/train_cpu.sbatch`) via a
-`MODE` switch.
-
-The benchmark cluster is chosen with `--cluster`:
-
-* `--cluster local` (default) — single-node `LocalCluster` sized to `p` (dev box / one
-  fat node).
-* `--cluster slurm` — multi-node `dask-jobqueue` fleet of `p` worker processes (the D6
-  path). Requires `--slurm-queue` (+ usually `--slurm-account`). The harness calls
-  `client.wait_for_workers(p)` before timing, so SLURM queue/startup latency is excluded
-  from `wall_s`. One fleet is built per `p` and reused across that `p`'s trials.
-
-Real CPU scaling run on SLURM (inputs prebuilt under `--results`), via the sbatch:
-
-```bash
-MODE=benchmark BASE="$BASE" RESULTS="$RESULTS" \
-    P_LIST=1,2,4,8,16,32 TRIALS=3 NUM_BUCKETS=256 PHASES=train,forecast \
-    sbatch HPC_code/sbatch/train_cpu.sbatch
-# -> writes $RESULTS/scaling_cpu_<label>.csv
-
-python HPC_code/analyze_scaling.py --csv "$RESULTS/scaling_cpu_v1.csv" \
-    --out-dir "$RESULTS/scaling_plots" --md-out "$RESULTS/scaling_tables.md"
-```
-
-Or invoke the driver directly (e.g. on one node with `--cluster local`):
-
-```bash
-python HPC_code/benchmark_scaling.py \
-    --base "$BASE" --results "$RESULTS" \
-    --hw cpu --cluster slurm --slurm-queue "$PARTITION" --slurm-account "$ACCT" \
-    --mode strong --p-list 1,2,4,8,16,32 --trials 3 \
-    --num-buckets 256 --phases train,forecast --dataset-label v1 \
-    --out-csv "$RESULTS/scaling_cpu_v1.csv"
-```
-
-Modes: **strong** holds a fixed bucket set (`--num-buckets B`, ideally `B ≥ 4·max(p)`)
-across all `p`; **weak** grows the set as `n(p) = n0·p` (`--n0`). The CSV schema is
-`dataset, mode, hw, p, n_ids, B, phase, trial, wall_s, timestamp`, appended
-incrementally so an interrupted run still yields a usable file.
-
-Run the smoke test with `pytest HPC_code/tests/test_benchmark_smoke.py -q`.
+> **Caveats.** Confirm the MIG slice's FP64/HBM ceilings on the real GPU node. The "v1.1 vs v1.2"
+> finding is **SME-validate-before-publish**, and any generative-AI assistance should be disclosed.

@@ -164,6 +164,47 @@ BASE="$BASE" RESULTS=results_v11 FORECAST=1 \
 bucket) and, with `FORECAST=1`, `predictions/` (+ combined `td_predictions.parquet`). Swap
 `results_v11`→`results_v12` to train on v1.2. For a single dev box, add `CLUSTER=local`.
 
+## Runbook C — compare PISCOt v1.1 vs v1.2 (science)
+
+This is a **held-out skill** comparison, *not* a benchmark: train both TMIN versions on a
+window, forecast a *withheld* window, and score the forecasts against observed `TD`. The
+withheld window must have observed `td` **and** future TMIN for **both** versions, so it must
+lie inside the v1.1 range — use e.g. train **1981–2014**, forecast **2015–2016** (1981–2016 is
+the v11∩v12 overlap). Prep with that split (own result roots so production runs aren't
+clobbered):
+
+```bash
+# Phase 0 with a held-out split, per version:
+for V in v11 v12; do
+  python HPC_code/prep_inputs.py --base "$BASE" --results cmp_$V \
+      --td-var td --tmin-var tmin_$V \
+      --train-start 1981 --train-end 2014 --pred-start 2015 --pred-end 2016 \
+      --num-buckets 1024 --n-workers 32        # or: sbatch sbatch/prep_inputs.sbatch
+done
+
+# Train + FORECAST both (forecast is required — predictions are what gets scored):
+BASE="$BASE" RESULTS=cmp_v11 P=32 FORECAST=1 sbatch HPC_code/sbatch/train_cpu.sbatch
+BASE="$BASE" RESULTS=cmp_v12 P=32 FORECAST=1 sbatch HPC_code/sbatch/train_cpu.sbatch
+
+# 1) Skill vs OBSERVED td — RMSE / MAE / bias / Pearson r / cosine, v1.1 vs v1.2:
+python HPC_code/evaluate_accuracy.py \
+    --pred-a cmp_v11/predictions --pred-b cmp_v12/predictions \
+    --obs "$BASE/td/Outputs" --label-a v1.1 --label-b v1.2 \
+    --out-dir cmp/plots --md-out cmp/accuracy_v11_v12.md
+
+# 2) How the two models' coefficients + predictions agree (+ cosine):
+python HPC_code/compare_datasets.py \
+    --coeffs-a cmp_v11/llr_coeffs_anomaly_dataset --coeffs-b cmp_v12/llr_coeffs_anomaly_dataset \
+    --pred-a cmp_v11/predictions --pred-b cmp_v12/predictions \
+    --label-a v1.1 --label-b v1.2 --out-dir cmp/plots --md-out cmp/compare_v11_v12.md
+```
+
+**Outputs:** `cmp/accuracy_v11_v12.md` (which version forecasts `TD` better — the "Lower RMSE"
+verdict) and `cmp/compare_v11_v12.md` (coefficient/prediction agreement), plus PNGs in
+`cmp/plots/` (residuals, pred-vs-obs, monthly RMSE; Δ-histograms, R² scatter). On a single dev
+box add `CLUSTER=local` to the train jobs. (Runbooks A/B use one version and never forecast for
+scoring; only Runbook C compares versions.)
+
 ## Install
 
 ```bash

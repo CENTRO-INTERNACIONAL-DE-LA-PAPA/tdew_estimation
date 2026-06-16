@@ -99,9 +99,18 @@ python HPC_code/prep_inputs.py --base "$BASE" --results results_v12 \
 
 This writes under each `results_*/`: `daily_climatology.parquet`, `bucketed_training_data/`,
 `climatology_by_bucket/`, `future_tmin_by_bucket/`. **The dataset version is baked in here**
-(via `--tmin-var`); downstream jobs just point at `--results`. On KHIPU wrap it on the CPU
-partition, e.g. `srun -p standard -A postgrado -c 16 python HPC_code/prep_inputs.py …`.
-Use `--num-buckets 1024` so `B ≥ 4·p_max` for the CPU scaling sweep.
+(via `--tmin-var`); downstream jobs just point at `--results`. Use `--num-buckets 1024` so
+`B ≥ 4·p_max` for the CPU scaling sweep.
+
+`--n-workers` parallelises the dominant **bucket-year build** (one process per training year;
+identical output, only faster — climatology/shards stay sequential). On KHIPU submit it as a
+batch job on `standard` (it auto-uses `--n-workers $SLURM_CPUS_PER_TASK`):
+
+```bash
+mkdir -p logs
+BASE="$BASE" RESULTS=results_v11 TMIN_VAR=tmin_v11 sbatch HPC_code/sbatch/prep_inputs.sbatch
+BASE="$BASE" RESULTS=results_v12 TMIN_VAR=tmin_v12 sbatch HPC_code/sbatch/prep_inputs.sbatch
+```
 
 ## Runbook A — prep → benchmark → results
 

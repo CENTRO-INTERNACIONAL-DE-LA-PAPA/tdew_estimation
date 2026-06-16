@@ -77,30 +77,35 @@ pip install --extra-index-url=https://pypi.nvidia.com \
 ## Run
 
 ```bash
+mkdir -p logs    # REQUIRED first: SLURM opens logs/*.out before the job body runs
+
 # Baseline P=1 (any machine)
 python HPC_code/run_training_hpc.py --base "$BASE" --results "$RESULTS" \
     --cluster local --n-workers 1
 
-# CPU SLURM, P=32, train+forecast
+# CPU multi-node fleet on SLURM (KHIPU: partition standard, account postgrado), P=32:
 BASE=... RESULTS=... P=32 FORECAST=1 sbatch HPC_code/sbatch/train_cpu.sbatch
 
-# A100, P=4 GPUs
-BASE=... RESULTS=... P=4 sbatch HPC_code/sbatch/train_gpu_a100.sbatch
+# Single GPU (KHIPU: one A100 MIG slice, partition gpu/ag001), client=None — no dask-cuda:
+BASE=... RESULTS=... sbatch HPC_code/sbatch/train_gpu_a100.sbatch
 ```
 
-> **Needed before SLURM submission:** the cluster's **account**, **CPU partition**, and
-> **A100 partition** names — fill the `TODO` placeholders in the `sbatch/` files.
+The `sbatch/` files are preset for **KHIPU** (`account=postgrado`; CPU `standard`; GPU `gpu`
+node `ag001`, `--gres=gpu:a100_3g.20gb:1`; `cpu=32` / `08:00:00` account limits). Override per
+site on the command line, e.g. `sbatch -p debug ...`. For a single dev box with a local SLURM,
+set `CLUSTER=local` so the CPU job runs on the one node instead of spawning a `dask-jobqueue`
+fleet.
 
 `--bucket-ids start:end` restricts the run to a deterministic subset of buckets — used
 for weak scaling (`n = n0·p`) and for smoke tests.
 
 ## Benchmarking (D4)
 
-`benchmark_scaling.py` produces the scaling CSVs and `analyze_scaling.py` turns them
-into the tables/plots embedded in `tdew_estimation_pram.qmd`. CPU-only for now:
-`--hw gpu` is reserved for D6 (needs the D3 GPU training path + the conda/RAPIDS env)
-and currently raises a clear error; the CSV's `hw` column already reserves the slot so
-GPU rows append cleanly later.
+`benchmark_scaling.py` produces the scaling CSVs and `analyze_scaling.py` / `analyze_gpu.py`
+turn them into standalone tables + PNG plots. `--hw cpu` sweeps CPU workers; `--hw gpu
+--gpu-train` runs the D3 GPU batched-WLS trainer (single GPU with `--cluster local`, `p-list 1`;
+multi-GPU with `--cluster cuda` later). The CSV's `hw` column separates CPU and GPU rows so
+`analyze_gpu.py` can build the CPU-vs-GPU overlay.
 
 Install the (lightweight) plotting extra:
 

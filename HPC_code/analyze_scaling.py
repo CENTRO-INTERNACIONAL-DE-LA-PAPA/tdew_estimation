@@ -165,6 +165,109 @@ def make_plots(metrics: pd.DataFrame, out_dir: Path) -> list[Path]:
     return written
 
 
+# ---------------------------------------------------------------------------------------
+# Family view (--by-size): one curve per problem size N, over the processor axis p.
+# Fix N, sweep p; increase N, sweep p again -> a family. Weak scaling is then the locus
+# across curves where work-per-worker N/p is constant.
+# ---------------------------------------------------------------------------------------
+FAMILY_KEYS = ["dataset", "hw", "phase"]
+
+
+def family_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    """Strong-mode rows, per (dataset,hw,phase,B): median wall_s + speedup/efficiency vs p."""
+    d = df[df["mode"] == "strong"]
+    if d.empty:
+        raise ValueError("--by-size needs strong-mode rows (multiple --num-buckets N).")
+    g = (d.groupby(FAMILY_KEYS + ["B", "p"], as_index=False)
+           .agg(wall_s=("wall_s", "median"), n_ids=("n_ids", "first")))
+    out = []
+    for _, s in g.groupby(FAMILY_KEYS + ["B"], sort=True):
+        s = s.sort_values("p").copy()
+        t1 = float(s["wall_s"].iloc[0])  # smallest p
+        s["speedup"] = t1 / s["wall_s"]
+        s["efficiency"] = s["speedup"] / s["p"]
+        out.append(s)
+    return pd.concat(out, ignore_index=True)
+
+
+def make_family_plots(fam: pd.DataFrame, out_dir: Path) -> list[Path]:
+    """Time / Speedup / Efficiency vs p, one line per N (=B), per (dataset,hw,phase)."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    for keys, g in fam.groupby(FAMILY_KEYS, sort=True):
+        dataset, hw, phase = keys
+        sizes = sorted(g["B"].unique())
+        colors = plt.cm.viridis([i / max(len(sizes) - 1, 1) * 0.7 + 0.15 for i in range(len(sizes))])
+        base = _slug(dataset, hw, phase)
+
+        def _label(B):
+            nid = int(g[g.B == B]["n_ids"].iloc[0])
+            return f"N={nid} IDs (B={int(B)})"
+
+        specs = [
+            ("wall_s", "median wall time (s)", "log", "Time vs p", f"family_time_{base}.png", None),
+            ("speedup", "speedup S(p)=T(N,1)/T(N,p)", "log", "Speedup vs p", f"family_speedup_{base}.png", "ideal"),
+            ("efficiency", "efficiency E(p)=S/p", "linear", "Efficiency vs p", f"family_efficiency_{base}.png", "one"),
+        ]
+        for col, ylabel, yscale, title, fname, ideal in specs:
+            fig, ax = plt.subplots(figsize=(6, 4.5))
+            pmax = int(g["p"].max())
+            if ideal == "ideal":
+                ax.plot([1, pmax], [1, pmax], "--", color="gray", label="ideal S=p")
+            elif ideal == "one":
+                ax.axhline(1.0, linestyle="--", color="gray", label="ideal E=1")
+            for B, c in zip(sizes, colors):
+                s = g[g.B == B].sort_values("p")
+                ax.plot(s["p"], s[col], marker="o", color=c, label=_label(B))
+            ax.set_xscale("log", base=2)
+            if yscale == "log":
+                ax.set_yscale("log")
+            else:
+                ax.set_ylim(0, 1.15)
+            ax.set_xlabel("processors p")
+            ax.set_ylabel(ylabel)
+            ax.set_title(f"{title} — {dataset}/{hw}/{phase} (per N)")
+            ax.grid(True, which="both", alpha=0.3)
+            ax.legend(fontsize=8)
+            f = out_dir / fname
+            fig.tight_layout()
+            fig.savefig(f, dpi=120)
+            plt.close(fig)
+            written.append(f)
+    log.info("[analyze] wrote %s family plot(s) -> %s", len(written), out_dir)
+    return written
+
+
+def write_family_markdown(fam: pd.DataFrame, md_out: Path) -> None:
+    lines: list[str] = ["# Scaling results — family by problem size N", ""]
+    for keys, g in fam.groupby(FAMILY_KEYS, sort=True):
+        dataset, hw, phase = keys
+        lines.append(f"## {dataset} — {hw} — {phase}")
+        for B, s in g.groupby("B", sort=True):
+            s = s.sort_values("p")
+            nid = int(s["n_ids"].iloc[0])
+            lines += ["", f"### N = {nid} IDs (B={int(B)})", "",
+                      "| p | wall_s | S(p) | E(p) |", "|---:|---:|---:|---:|"]
+            for _, r in s.iterrows():
+                lines.append(f"| {int(r['p'])} | {r['wall_s']:.2f} | {r['speedup']:.2f} | {r['efficiency']:.3f} |")
+        # weak-scaling diagonal: constant work-per-worker n0 = B/p
+        piv = g.pivot_table(index="B", columns="p", values="wall_s")
+        sizes = sorted(g["B"].unique()); ps = sorted(int(p) for p in g["p"].unique())
+        lines += ["", "### Weak diagonals (constant N/p): E_weak(p)=T(n0,1)/T(n0·p,p)", ""]
+        for n0 in sizes:
+            pts = [(p, n0 * p, float(piv.loc[n0 * p, p])) for p in ps
+                   if (n0 * p) in piv.index and p in piv.columns and not pd.isna(piv.loc[n0 * p, p])]
+            if len(pts) < 2:
+                continue
+            t0 = pts[0][2]
+            chain = ", ".join(f"p={p}(B={B}) E={t0/t:.3f}" for p, B, t in pts)
+            lines.append(f"- n0={n0} buckets/worker → {chain}")
+        lines.append("")
+    md_out.parent.mkdir(parents=True, exist_ok=True)
+    md_out.write_text("\n".join(lines), encoding="utf-8")
+    log.info("[analyze] wrote family tables -> %s", md_out)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Compute scaling metrics and render tables/plots from benchmark CSVs.",
@@ -173,6 +276,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--csv", required=True, nargs="+", type=Path, help="One or more CSVs.")
     p.add_argument("--out-dir", required=True, type=Path, help="Directory for PNG plots.")
     p.add_argument("--md-out", required=True, type=Path, help="Markdown tables output.")
+    p.add_argument(
+        "--by-size",
+        action="store_true",
+        help="Family view: one curve per problem size N (=B), over p, for Time/Speedup/Efficiency "
+        "(use with a CSV containing strong-mode runs at several --num-buckets). Weak scaling is "
+        "read off the constant-N/p diagonals.",
+    )
     return p
 
 
@@ -180,6 +290,11 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = build_parser().parse_args(argv)
     df = load_csvs(args.csv)
+    if args.by_size:
+        fam = family_metrics(df)
+        write_family_markdown(fam, args.md_out)
+        make_family_plots(fam, args.out_dir)
+        return 0
     agg = median_by_p(df)
     metrics = compute_metrics(agg)
     write_markdown(metrics, args.md_out)

@@ -39,6 +39,8 @@ are identical — only the processor count `P` changes.
 |------|---------|
 | `hpc.py` | Cluster builders: `make_slurm_cluster` (dask-jobqueue), `make_local_cuda_cluster` (dask-cuda), `make_local_cpu_cluster` (baseline / `P=1`). Each returns a live `Client`. |
 | `nc_to_point_parquet.py` | Extract PISCOt `.nc` rasters → per-point monthly parquet (Python/xarray port of the R/`terra` step). Potato-points or full-grid via `--peru-potato`. |
+| `make_subset.py` | Filter the data to the first N IDs → a drop-in `--base` subset (for the CPU benchmark + quick tests). |
+| `sbatch/bench_cpu_family.sbatch` | CPU scaling **family** in one job: strong p-sweep at several N + weak, → one CSV for `analyze_scaling.py --by-size`. |
 | `sbatch/download_data.sh` | Download the 3 figshare PISCOt products (`.nc`) and run the extractor per variable. Resume-safe, idempotent. |
 | `prep_inputs.py` / `sbatch/prep_inputs.sbatch` | **Step 2 (prep)**: build the reusable bucketed inputs (climatology, bucket-year dataset, shards) — *no training_. `--n-workers` parallelises it. |
 | `run_training_hpc.py` | Train entrypoint: build `local\|slurm\|cuda` cluster → train coefficients (+ optional forecast). |
@@ -212,6 +214,66 @@ python HPC_code/compare_datasets.py \
 
 → `cmp/accuracy_v11_v12.md` (the "Lower RMSE" verdict — which version wins) and
 `cmp/compare_v11_v12.md` (coefficient/prediction agreement), plus PNGs in `cmp/plots/`.
+
+---
+
+# Run on KHIPU (end-to-end)
+
+KHIPU limits: account `postgrado`; **32 cores, 98 GB RAM, 1 A100 MIG slice
+(`--gres=gpu:a100_3g.20gb:1`, the sbatch default), 8 h walltime.** A full `p=1` CPU baseline on
+300k IDs is ~80 h, so **benchmark CPU on a subset** (the scaling ratio is size-independent) and
+**run/benchmark 300k on the GPU** (~15–25 min). Strategy: **prep locally → transfer the bucketed
+inputs → 3 jobs** (each ≤ 8 h). Save all outputs under a persistent path (`$OUT=…/results`),
+never `/tmp`.
+
+### 1. Local: subset, prep, transfer
+```bash
+FULL=/media/ppalacios/Data/henry_simcast_peru          # your data
+# CPU-benchmark subset (4000 IDs, v12) -> prep at B=256
+python HPC_code/make_subset.py --base "$FULL" --out "$FULL/sub4k" --n-ids 4000 \
+    --vars td,tmin_v12 --year-range 1981,2016
+python HPC_code/prep_inputs.py --base "$FULL/sub4k" --results "$FULL/res_cpu_v12" \
+    --tmin-var tmin_v12 --train-start 1981 --train-end 2016 --no-future --num-buckets 256 --n-workers 24
+# FULL 300k v12 (production model + GPU end-to-end point) -> B=1024
+python HPC_code/prep_inputs.py --base "$FULL" --results "$FULL/res_v12_300k" --tmin-var tmin_v12 \
+    --train-start 1981 --train-end 2016 --pred-start 2017 --pred-end 2018 --num-buckets 1024 --n-workers 24
+# Comparison subset (20k IDs, both versions, HELD-OUT split) -> B=512
+python HPC_code/make_subset.py --base "$FULL" --out "$FULL/cmp20k" --n-ids 20000 \
+    --vars td,tmin_v11,tmin_v12 --year-range 1981,2015
+for V in v11 v12; do python HPC_code/prep_inputs.py --base "$FULL/cmp20k" --results "$FULL/cmp_$V" \
+    --tmin-var tmin_$V --train-start 1981 --train-end 2014 --pred-start 2015 --pred-end 2015 \
+    --num-buckets 512 --n-workers 24 ; done
+# transfer one tar stream per result root (avoids 1000s of small files)
+for d in res_cpu_v12 res_v12_300k cmp_v11 cmp_v12; do
+  tar -C "$FULL/$d" -cf - . | zstd | ssh khipu "mkdir -p \$SCRATCH/$d && zstd -d | tar -C \$SCRATCH/$d -xf -"; done
+```
+
+### 2. KHIPU: three jobs (`mkdir -p logs` first)
+```bash
+# JOB A — CPU scaling family (standard, 32c): N={1000,2000,4000} x p={1..32}, ~4.5 h
+RESULTS=$SCRATCH/res_cpu_v12 N_LIST=64,128,256 P_LIST=1,2,4,8,16,32 \
+    sbatch HPC_code/sbatch/bench_cpu_family.sbatch
+python HPC_code/analyze_scaling.py --by-size --csv $SCRATCH/res_cpu_v12/scaling_cpu_v12.csv \
+    --out-dir $SCRATCH/res_cpu_v12/cpu_family_plots --md-out $SCRATCH/res_cpu_v12/cpu_family_tables.md
+
+# JOB B — GPU roofline + 300k model (gpu): roofline, then train the 300k model, <1 h
+MODE=benchmark RESULTS=$SCRATCH/res_v12_300k sbatch HPC_code/sbatch/train_gpu_a100.sbatch
+MODE=train FORECAST=1 RESULTS=$SCRATCH/res_v12_300k sbatch HPC_code/sbatch/train_gpu_a100.sbatch
+python HPC_code/analyze_gpu.py --kernel-csv $SCRATCH/res_v12_300k/gpu_kernel.csv \
+    --pipeline-csv $SCRATCH/res_v12_300k/gpu_pipeline.csv --scaling-csv $SCRATCH/res_v12_300k/scaling_gpu.csv \
+    --peak-fp64-gflops 4200 --out-dir $SCRATCH/res_v12_300k/gpu_plots --md-out $SCRATCH/res_v12_300k/gpu_report.md
+
+# JOB C — v1.1 vs v1.2 comparison on GPU (gpu): train+forecast both 20k held-out, ~2-3 h
+for V in v11 v12; do MODE=train FORECAST=1 RESULTS=$SCRATCH/cmp_$V \
+    sbatch HPC_code/sbatch/train_gpu_a100.sbatch ; done
+python HPC_code/evaluate_accuracy.py --pred-a $SCRATCH/cmp_v11/predictions --pred-b $SCRATCH/cmp_v12/predictions \
+    --obs $SCRATCH/cmp20k/td/Outputs --label-a v1.1 --label-b v1.2 \
+    --out-dir $SCRATCH/cmp/plots --md-out $SCRATCH/cmp/accuracy_v11_v12.md
+```
+`make_subset.py` builds the ID subsets; `bench_cpu_family.sbatch` runs the whole N×p family in one
+job; `analyze_scaling.py --by-size` makes the per-N Time/Speedup/Efficiency curves + weak diagonals.
+The comparison is on **20k IDs** (statistically ample; forecast is CPU-bound, so this keeps Job C
+inside 8 h). Job B's 300k train doubles as your production model.
 
 ---
 

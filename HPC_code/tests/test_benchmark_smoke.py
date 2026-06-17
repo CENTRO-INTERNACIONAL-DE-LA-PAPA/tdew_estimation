@@ -104,6 +104,40 @@ def test_slurm_requires_queue() -> None:
         benchmark_scaling.make_bench_client(ns, 1)
 
 
+def test_analyze_scaling_by_size_family(tmp_path: Path) -> None:
+    """--by-size: one curve per N (=B), with per-N speedup/efficiency + the 3 family plots."""
+    # Two problem sizes (B=4, B=8) swept over p={1,2,4}; ideal-ish halving times.
+    rows = [
+        # B=4 (n_ids=40): T = 100/p
+        ("v1", "strong", "cpu", 1, 40, 4, "train", 1, 100.0),
+        ("v1", "strong", "cpu", 2, 40, 4, "train", 1, 50.0),
+        ("v1", "strong", "cpu", 4, 40, 4, "train", 1, 25.0),
+        # B=8 (n_ids=80): T = 200/p
+        ("v1", "strong", "cpu", 1, 80, 8, "train", 1, 200.0),
+        ("v1", "strong", "cpu", 2, 80, 8, "train", 1, 100.0),
+        ("v1", "strong", "cpu", 4, 80, 8, "train", 1, 50.0),
+    ]
+    csv_path = tmp_path / "grid.csv"
+    with csv_path.open("w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["dataset", "mode", "hw", "p", "n_ids", "B", "phase", "trial", "wall_s"])
+        w.writerows(rows)
+
+    out_dir = tmp_path / "fam"
+    md = tmp_path / "fam.md"
+    rc = analyze_scaling.main(["--by-size", "--csv", str(csv_path), "--out-dir", str(out_dir), "--md-out", str(md)])
+    assert rc == 0
+    for f in ("family_time_v1_cpu_train.png", "family_speedup_v1_cpu_train.png", "family_efficiency_v1_cpu_train.png"):
+        assert (out_dir / f).exists()
+
+    fam = analyze_scaling.family_metrics(__import__("pandas").read_csv(csv_path))
+    # Perfect halving -> S(4)=4, E=1.0 for both N.
+    s4 = fam[(fam.B == 8) & (fam.p == 4)].iloc[0]
+    assert abs(s4["speedup"] - 4.0) < 1e-9 and abs(s4["efficiency"] - 1.0) < 1e-9
+    text = md.read_text()
+    assert "family by problem size N" in text and "Weak diagonals" in text
+
+
 def test_gpu_options_accepted() -> None:
     """D3 Phase B un-gated GPU: --hw gpu / --gpu-train / --cluster cuda now parse cleanly
     (no NotImplementedError). The actual GPU run is exercised by test_gpu_runner_smoke.py."""

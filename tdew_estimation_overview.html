@@ -2360,7 +2360,7 @@ window.Quarto = {
 <h2 class="anchored" data-anchor-id="what-is-it-for">What is it for?</h2>
 <p>Many scientific applications—like forecasting plant disease risks, running environmental models, or filling out weather records—need complete, accurate records of daily dewpoint temperature for different locations (called “grid cells”). However, not all weather stations measure dewpoint every day; sometimes, important days or locations are missing this measurement.</p>
 <p>This tool helps by <strong>reconstructing or estimating</strong> the missing values using a statistical model. In one sentence: it learns, separately for every location and every time of year, how the dewpoint <em>departs from its normal value</em> whenever the minimum temperature departs from <em>its</em> normal value—and then uses that learned relationship to fill in the missing dewpoint from the (usually available) minimum-temperature record.</p>
-<p>All of this is done at <strong>high spatial resolution</strong> (many grid cells—on the order of hundreds of thousands) and for cases where dewpoint is missing or has gaps.</p>
+<p>The data come from <strong>PISCOt</strong>, a gridded daily climate product for Peru. The full national grid holds roughly <strong>2 million cells (<code>ID</code>s)</strong>, but this project does not need all of them: it restricts the work to the <strong>Peru potato-planting zones, about 302,000 cells</strong> (the default <code>--peru-potato</code> domain in the run scripts). Running the full ~2M grid is possible but is about <strong>6.6× the work</strong>. All of this is done at high spatial resolution and specifically for cases where dewpoint is missing or has gaps.</p>
 </section>
 <section id="the-statistical-model-what-we-estimate-and-why" class="level2">
 <h2 class="anchored" data-anchor-id="the-statistical-model-what-we-estimate-and-why">The statistical model: what we estimate and why</h2>
@@ -2400,13 +2400,23 @@ TD_{\text{anom}} \;\approx\; \beta_0
 </ul>
 <p>The result is <strong>one set of five coefficients <span class="math inline">\((\beta_0,\dots,\beta_4)\)</span> for every <span class="math inline">\((ID, doy)\)</span> pair</strong>, plus an <span class="math inline">\(R^2\)</span>. To predict a missing dewpoint, the tool re-attaches the baseline: <span class="math inline">\(\widehat{TD} = \overline{TD}(ID, doy) + \widehat{TD}_{\text{anom}}\)</span>.</p>
 </section>
+<section id="the-training-period-and-how-we-check-it-out-of-sample" class="level3">
+<h3 class="anchored" data-anchor-id="the-training-period-and-how-we-check-it-out-of-sample">The training period and how we check it out-of-sample</h3>
+<p>The model is <strong>trained on the years 1981–2016</strong> — that is <strong>36 years</strong> of daily PISCOt records (the <code>--train-start 1981 --train-end 2016</code> setting used throughout the run scripts). The production model uses the <strong>whole</strong> 1981–2016 record for every cell, because the goal is the most stable possible coefficients before applying them to fill gaps or to forecast later years (e.g. 2017 onward).</p>
+<p>To judge whether the estimates are actually any good, we validate <strong>out-of-sample in time</strong>: fit on an early stretch of years and predict a <em>held-out</em> later stretch the model never saw. A clean way to report skill is a split such as <strong>train 1981–2001, test 2002–2016</strong>; in the repository’s TMIN-version comparison the same idea is applied as train-through-2014 / forecast-2015. The principle is the standard one — never score a model on the same days it was fitted on.</p>
+</section>
 <section id="why-this-is-a-big-estimation-problem" class="level3">
 <h3 class="anchored" data-anchor-id="why-this-is-a-big-estimation-problem">Why this is a <em>big</em> estimation problem</h3>
-<p>This is where the statistics meets the computing. The model is not one regression—it is an enormous <strong>family of tiny, independent regressions</strong>. With on the order of <span class="math inline">\(3\times10^5\)</span> locations and <span class="math inline">\(366\)</span> days of the year, the tool fits roughly</p>
-<p><span class="math display">\[
-3\times10^5 \text{ locations} \;\times\; 366 \text{ days} \;\approx\; 1.1\times10^{8}
-\]</span></p>
-<p>separate <span class="math inline">\(5\times5\)</span> weighted least-squares problems. Each one is trivial on its own (a 5-parameter regression solves in microseconds), but there are <em>one hundred million</em> of them. That combination—each task tiny, the count astronomical, and every task fully independent of the others—is exactly what makes the next sections (Dask, HPC, CPU vs. GPU) necessary.</p>
+<p>This is where the statistics meets the computing. Two different “large numbers” are at play, and it is worth keeping them apart:</p>
+<ul>
+<li><strong>How many regressions?</strong> The model is not one regression — it is an enormous <em>family of tiny, independent regressions</em>, <strong>one per <code>(ID, doy)</code> pair</strong>. The year axis does <strong>not</strong> multiply this count (the years are the <em>sample</em> inside each fit, not separate fits): <span class="math display">\[
+\underbrace{3.02\times10^5}_{\text{potato cells}} \;\times\; \underbrace{366}_{\text{days of year}} \;\approx\; 1.1\times10^{8} \text{ separate } 5\times5 \text{ WLS fits.}
+\]</span></li>
+<li><strong>How much data feeds them?</strong> Each fit pools 36 years of daily observations (within its <span class="math inline">\(\pm h\)</span> day window). Counting every daily record that must be read, de-seasonalized, lagged and weighted: <span class="math display">\[
+\underbrace{3.02\times10^5}_{\text{cells}} \;\times\; \underbrace{366}_{\text{days}} \;\times\; \underbrace{36}_{\text{years (1981–2016)}} \;\approx\; 4\times10^{9} \text{ daily observations.}
+\]</span></li>
+</ul>
+<p>So we solve <strong>~110 million</strong> independent regressions, fed by <strong>~4 billion</strong> daily data points. Each fit is trivial on its own (a 5-parameter regression solves in microseconds), but the sheer count — and the fact that every fit is fully independent of the others — is exactly what makes the next sections (Dask, HPC, CPU vs. GPU) necessary. (On the full ~2M-cell PISCOt grid these numbers grow by the ~6.6× factor mentioned earlier, to roughly <span class="math inline">\(7\times10^8\)</span> fits and <span class="math inline">\(2.7\times10^{10}\)</span> observations.)</p>
 </section>
 </section>
 <section id="why-we-parallelize-dask-and-hpc" class="level2">

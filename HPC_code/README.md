@@ -57,15 +57,55 @@ flowchart TD
 git clone https://github.com/CENTRO-INTERNACIONAL-DE-LA-PAPA/tdew_estimation.git
 cd tdew_estimation && git checkout develop
 
-# Python >=3.11 (on KHIPU: `module load python/3.11` first)
+# Python >=3.11 — on a module-based HPC, build the venv FROM a *shared* module python
+# (one that exists on the compute nodes, not the login node's system python). On KHIPU:
+#   module load python3/3.11.11
 python3 -m venv .venv && source .venv/bin/activate && pip install -U pip
 pip install -e ".[hpc,benchmark]"     # core + SLURM + plots — the CPU jobs
 pip install -e ".[gpu]"               # + cupy-cuda12x — the GPU jobs (CUDA 12.x)
 mkdir -p logs                         # REQUIRED: SLURM opens logs/*.out before the job body runs
 ```
 Core deps are light & CPU-only; GPU/extraction/multi-GPU live in extras (`.[gpu]` / `.[netcdf]` /
-`.[multigpu]`) so a plain install works anywhere. For the SLURM jobs, either activate this venv in
-the `# source .../.venv/bin/activate` line of each `sbatch`, or pass `PYTHON=.../.venv/bin/python`.
+`.[multigpu]`) so a plain install works anywhere. **On a SLURM/module cluster (e.g. KHIPU) read
+[Running on KHIPU](#running-on-khipu-site-specifics--reproducibility) below — there are three
+gotchas (env export, the python module, and `libpython` on compute nodes) you must handle, or jobs
+fail instantly.**
+
+# Running on KHIPU (site specifics & reproducibility)
+
+These are the exact settings that make the jobs run on KHIPU (OpenHPC + Slurm). They generalise to
+any module-based cluster — only the module name / paths change.
+
+1. **Build the venv from a *shared* module python, not the login system python.** The login node's
+   `libpython3.11.so.1.0` is absent on compute nodes, so a venv built from `/usr/bin/python3` dies
+   with `error while loading shared libraries`. Use the OpenHPC module (shared `/opt/ohpc`, present
+   on every node):
+   ```bash
+   source /etc/profile.d/lmod.sh ; module load python3/3.11.11
+   python3 -m venv .venv && source .venv/bin/activate && pip install -U pip
+   pip install -e ".[hpc,benchmark]" && pip install -e ".[gpu]"
+   ```
+2. **Submit with `export … ; sbatch --export=ALL`.** KHIPU's Slurm does **not** propagate the inline
+   `VAR=val sbatch …` form, so `RESULTS`/`N_LIST`/… never reach the job. Always:
+   ```bash
+   export RUN=/home/$USER/tdew_run                 # no $SCRATCH on KHIPU; /home is shared, 14T free
+   export RESULTS=$RUN/res_cpu_v12 N_LIST=64,128,256 P_LIST=1,2,4,8,16,32 CLUSTER=local
+   sbatch --export=ALL HPC_code/sbatch/bench_cpu_family.sbatch
+   ```
+3. **Fill the activation line in each `sbatch`** (`bench_cpu_family`, `train_cpu`, `train_gpu_a100`)
+   with the block below — `module` is not a function in the batch shell (source `lmod.sh` first),
+   it can return non-zero (guard with `set +e`), and the explicit `LD_LIBRARY_PATH` guarantees the
+   venv python finds `libpython` on the compute node:
+   ```bash
+   set +e
+   source /etc/profile.d/lmod.sh 2>/dev/null; module load python3/3.11.11 2>/dev/null
+   source /home/$USER/tdew_estimation/.venv/bin/activate 2>/dev/null
+   set -e
+   export LD_LIBRARY_PATH=/opt/ohpc/pub/libs/gnu12/python3/3.11.11/lib:${LD_LIBRARY_PATH:-}
+   ```
+4. **Walltime:** use `#SBATCH --time=07:59:00` (the `08:00:00` cap can be rejected by QOS).
+5. **Account cap = 32 cores + 1 GPU**, so the 32-core CPU job and the GPU jobs can't run together —
+   submit them all and the GPU jobs queue behind the CPU benchmark.
 
 # Get the data
 
@@ -131,8 +171,10 @@ Otherwise set `RUN=$BASE` and continue.
 Strong = fix the problem, add workers; weak = grow the problem with the workers. (Family = one
 curve per problem size N.)
 ```bash
-RESULTS=$RUN/res_cpu_v12 N_LIST=64,128,256 P_LIST=1,2,4,8,16,32 \
-    sbatch HPC_code/sbatch/bench_cpu_family.sbatch
+# NOTE: export the vars (NOT `VAR=val sbatch`) + --export=ALL — KHIPU won't propagate inline env.
+export RESULTS=$RUN/res_cpu_v12 N_LIST=64,128,256 P_LIST=1,2,4,8,16,32 CLUSTER=local
+sbatch --export=ALL HPC_code/sbatch/bench_cpu_family.sbatch
+# when done:
 python HPC_code/analyze_scaling.py --by-size --csv $RUN/res_cpu_v12/scaling_cpu_v12.csv \
     --out-dir $RUN/res_cpu_v12/cpu_family_plots --md-out $RUN/res_cpu_v12/cpu_family_tables.md
 ```
@@ -141,8 +183,10 @@ python HPC_code/analyze_scaling.py --by-size --csv $RUN/res_cpu_v12/scaling_cpu_
 intensity on a **roofline** (low AI → memory-bandwidth bound), throughput vs M, and CPU-vs-GPU.
 The second command also trains the 300k model (= the GPU end-to-end point).
 ```bash
-MODE=benchmark RESULTS=$RUN/res_v12_300k sbatch HPC_code/sbatch/train_gpu_a100.sbatch
-MODE=train FORECAST=1 RESULTS=$RUN/res_v12_300k sbatch HPC_code/sbatch/train_gpu_a100.sbatch
+export RESULTS=$RUN/res_v12_300k
+export MODE=benchmark ;            sbatch --export=ALL HPC_code/sbatch/train_gpu_a100.sbatch
+export MODE=train ; unset FORECAST; sbatch --export=ALL HPC_code/sbatch/train_gpu_a100.sbatch
+# when both done:
 python HPC_code/analyze_gpu.py --kernel-csv $RUN/res_v12_300k/gpu_kernel.csv \
     --pipeline-csv $RUN/res_v12_300k/gpu_pipeline.csv --scaling-csv $RUN/res_v12_300k/scaling_gpu.csv \
     --peak-fp64-gflops 4200 --out-dir $RUN/res_v12_300k/gpu_plots --md-out $RUN/res_v12_300k/gpu_report.md
@@ -151,8 +195,9 @@ python HPC_code/analyze_gpu.py --kernel-csv $RUN/res_v12_300k/gpu_kernel.csv \
 **Comparison — which version predicts TDEW better?** Train both, forecast the withheld window,
 score predicted vs **observed** `TD`: RMSE/MAE/bias/Pearson r/**cosine**. Lower RMSE wins.
 ```bash
-for V in v11 v12; do MODE=train FORECAST=1 RESULTS=$RUN/cmp_$V \
-    sbatch HPC_code/sbatch/train_gpu_a100.sbatch ; done
+export MODE=train FORECAST=1
+for V in v11 v12; do export RESULTS=$RUN/cmp_$V; sbatch --export=ALL HPC_code/sbatch/train_gpu_a100.sbatch; done
+# when both done:
 python HPC_code/evaluate_accuracy.py --pred-a $RUN/cmp_v11/predictions --pred-b $RUN/cmp_v12/predictions \
     --obs $RUN/cmp20k/td/Outputs --label-a v1.1 --label-b v1.2 \
     --out-dir $RUN/cmp/plots --md-out $RUN/cmp/accuracy_v11_v12.md
@@ -185,9 +230,10 @@ python HPC_code/prep_inputs.py --base "$BASE" --results "$BASE/model_v12" --tmin
 ## B3 · Train → coefficients (+ optional forecast)
 ```bash
 # GPU (fast; ~15-25 min for 300k):
-MODE=train FORECAST=1 RESULTS=$RUN/model_v12 sbatch HPC_code/sbatch/train_gpu_a100.sbatch
+export MODE=train FORECAST=1 RESULTS=$RUN/model_v12
+sbatch --export=ALL HPC_code/sbatch/train_gpu_a100.sbatch
 # or CPU multi-node (P=32):
-# P=32 FORECAST=1 RESULTS=$RUN/model_v12 sbatch HPC_code/sbatch/train_cpu.sbatch
+# export P=32 FORECAST=1 RESULTS=$RUN/model_v12; sbatch --export=ALL HPC_code/sbatch/train_cpu.sbatch
 ```
 **Outputs** under `$RUN/model_v12/`: `llr_coeffs_anomaly_dataset/id_bucket=XXXX/coeffs.parquet`
 (the model) and, with `FORECAST=1`, `predictions/` (+ `td_predictions.parquet`). Swap `tmin_v12`→

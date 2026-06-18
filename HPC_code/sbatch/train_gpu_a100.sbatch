@@ -41,9 +41,17 @@ export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
 
 mkdir -p logs
 
-# --- TODO (KHIPU): environment activation (cupy venv) ---
-# module load cuda/12
-# source /path/to/.venv/bin/activate
+# --- Environment activation (KHIPU-tuned; guarded so it no-ops on other machines) ---
+set +e
+source /etc/profile.d/lmod.sh 2>/dev/null
+module load python3/3.11.11 2>/dev/null            # KHIPU OpenHPC module on shared /opt/ohpc
+# module load cuda/12 2>/dev/null                  # uncomment if cupy needs a CUDA module here
+for _v in "${SLURM_SUBMIT_DIR:-$PWD}/.venv" "$HOME/tdew_estimation/.venv" ".venv"; do
+  [ -f "$_v/bin/activate" ] && { source "$_v/bin/activate"; break; }
+done
+set -e
+_pylib=/opt/ohpc/pub/libs/gnu12/python3/3.11.11/lib
+[ -d "$_pylib" ] && export LD_LIBRARY_PATH="$_pylib:${LD_LIBRARY_PATH:-}"
 PYTHON="${PYTHON:-python}"
 
 BASE="${BASE:?set BASE=/path/to/base}"

@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32               # account limit cpu=32 -> P_LIST tops out at 32
 #SBATCH --mem=64G
-#SBATCH --time=08:00:00                  # KHIPU account max
+#SBATCH --time=07:59:00                  # just under the KHIPU 08:00:00 cap (avoids QOS edge)
 #SBATCH --output=logs/tdew-bench-family-%j.out
 #SBATCH --error=logs/tdew-bench-family-%j.err
 #
@@ -33,8 +33,17 @@ export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 mkdir -p logs
 
-# --- TODO (KHIPU): environment activation if not using $PYTHON directly ---
-# module load python/3.13 ; source /path/to/.venv/bin/activate
+# --- Environment activation (KHIPU-tuned; guarded so it no-ops on other machines) ---
+set +e
+source /etc/profile.d/lmod.sh 2>/dev/null
+module load python3/3.11.11 2>/dev/null            # KHIPU OpenHPC module on shared /opt/ohpc
+for _v in "${SLURM_SUBMIT_DIR:-$PWD}/.venv" "$HOME/tdew_estimation/.venv" ".venv"; do
+  [ -f "$_v/bin/activate" ] && { source "$_v/bin/activate"; break; }
+done
+set -e
+# venv python must find libpython on the compute nodes -> module lib dir, if present:
+_pylib=/opt/ohpc/pub/libs/gnu12/python3/3.11.11/lib
+[ -d "$_pylib" ] && export LD_LIBRARY_PATH="$_pylib:${LD_LIBRARY_PATH:-}"
 PYTHON="${PYTHON:-python}"
 
 RESULTS="${RESULTS:?set RESULTS=/path/to/prepped/results}"

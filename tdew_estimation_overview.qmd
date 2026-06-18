@@ -27,7 +27,7 @@ Many scientific applications—like forecasting plant disease risks, running env
 
 This tool helps by **reconstructing or estimating** the missing values using a statistical model. In one sentence: it learns, separately for every location and every time of year, how the dewpoint *departs from its normal value* whenever the minimum temperature departs from *its* normal value—and then uses that learned relationship to fill in the missing dewpoint from the (usually available) minimum-temperature record.
 
-All of this is done at **high spatial resolution** (many grid cells—on the order of hundreds of thousands) and for cases where dewpoint is missing or has gaps.
+The data come from **PISCOt**, a gridded daily climate product for Peru. The full national grid holds roughly **2 million cells (`ID`s)**, but this project does not need all of them: it restricts the work to the **Peru potato-planting zones, about 302,000 cells** (the default `--peru-potato` domain in the run scripts). Running the full ~2M grid is possible but is about **6.6× the work**. All of this is done at high spatial resolution and specifically for cases where dewpoint is missing or has gaps.
 
 
 ## The statistical model: what we estimate and why
@@ -76,15 +76,26 @@ Two design choices make this *local* rather than one global regression:
 
 The result is **one set of five coefficients $(\beta_0,\dots,\beta_4)$ for every $(ID, doy)$ pair**, plus an $R^2$. To predict a missing dewpoint, the tool re-attaches the baseline: $\widehat{TD} = \overline{TD}(ID, doy) + \widehat{TD}_{\text{anom}}$.
 
+### The training period and how we check it out-of-sample
+
+The model is **trained on the years 1981–2016** — that is **36 years** of daily PISCOt records (the `--train-start 1981 --train-end 2016` setting used throughout the run scripts). The production model uses the **whole** 1981–2016 record for every cell, because the goal is the most stable possible coefficients before applying them to fill gaps or to forecast later years (e.g. 2017 onward).
+
+To judge whether the estimates are actually any good, we validate **out-of-sample in time**: fit on an early stretch of years and predict a *held-out* later stretch the model never saw. A clean way to report skill is a split such as **train 1981–2001, test 2002–2016**; in the repository's TMIN-version comparison the same idea is applied as train-through-2014 / forecast-2015. The principle is the standard one — never score a model on the same days it was fitted on.
+
 ### Why this is a *big* estimation problem
 
-This is where the statistics meets the computing. The model is not one regression—it is an enormous **family of tiny, independent regressions**. With on the order of $3\times10^5$ locations and $366$ days of the year, the tool fits roughly
+This is where the statistics meets the computing. Two different "large numbers" are at play, and it is worth keeping them apart:
 
-$$
-3\times10^5 \text{ locations} \;\times\; 366 \text{ days} \;\approx\; 1.1\times10^{8}
-$$
+- **How many regressions?** The model is not one regression — it is an enormous *family of tiny, independent regressions*, **one per `(ID, doy)` pair**. The year axis does **not** multiply this count (the years are the *sample* inside each fit, not separate fits):
+  $$
+  \underbrace{3.02\times10^5}_{\text{potato cells}} \;\times\; \underbrace{366}_{\text{days of year}} \;\approx\; 1.1\times10^{8} \text{ separate } 5\times5 \text{ WLS fits.}
+  $$
+- **How much data feeds them?** Each fit pools 36 years of daily observations (within its $\pm h$ day window). Counting every daily record that must be read, de-seasonalized, lagged and weighted:
+  $$
+  \underbrace{3.02\times10^5}_{\text{cells}} \;\times\; \underbrace{366}_{\text{days}} \;\times\; \underbrace{36}_{\text{years (1981–2016)}} \;\approx\; 4\times10^{9} \text{ daily observations.}
+  $$
 
-separate $5\times5$ weighted least-squares problems. Each one is trivial on its own (a 5-parameter regression solves in microseconds), but there are *one hundred million* of them. That combination—each task tiny, the count astronomical, and every task fully independent of the others—is exactly what makes the next sections (Dask, HPC, CPU vs. GPU) necessary.
+So we solve **~110 million** independent regressions, fed by **~4 billion** daily data points. Each fit is trivial on its own (a 5-parameter regression solves in microseconds), but the sheer count — and the fact that every fit is fully independent of the others — is exactly what makes the next sections (Dask, HPC, CPU vs. GPU) necessary. (On the full ~2M-cell PISCOt grid these numbers grow by the ~6.6× factor mentioned earlier, to roughly $7\times10^8$ fits and $2.7\times10^{10}$ observations.)
 
 ## Why we parallelize: Dask and HPC
 

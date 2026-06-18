@@ -25,54 +25,129 @@ format:
 
 Many scientific applications—like forecasting plant disease risks, running environmental models, or filling out weather records—need complete, accurate records of daily dewpoint temperature for different locations (called "grid cells"). However, not all weather stations measure dewpoint every day; sometimes, important days or locations are missing this measurement.
 
-This tool helps by **reconstructing or estimating** the missing values using advanced statistical techniques. Specifically, it uses:
+This tool helps by **reconstructing or estimating** the missing values using a statistical model. In one sentence: it learns, separately for every location and every time of year, how the dewpoint *departs from its normal value* whenever the minimum temperature departs from *its* normal value—and then uses that learned relationship to fill in the missing dewpoint from the (usually available) minimum-temperature record.
 
-All of this is done at **high spatial resolution** (many grid cells) and for cases where dewpoint is missing or has gaps.
-
-
-## What is Dask, and why do we need it for this?
-
-Calculating all the required estimates for dewpoint across thousands of locations and all days in a year is a huge job—much too large for even a powerful personal laptop. This means:
-
-- The process involves millions of mini-calculations, since every location (sometimes tens of thousands) and every day of the year needs its own custom equation and data check.
-- Doing this work one-by-one would take weeks even on a powerful computer, and it might run out of memory or crash.
-
-**Dask** is a technology that lets us divide this giant task into smaller pieces and spread the pieces across many computers working together. Instead of one computer doing everything, Dask acts like an efficient manager in a large office—giving each worker a small part of the job. Everyone works in parallel, then results are combined at the end.
-
-**This project is designed to use clusters of computers—sometimes with dozens of machines—to finish in hours instead of weeks.**
-
-**What does this mean for users?**
-
-- You don’t need to be a coding expert, but the computation won’t run on a normal laptop or desktop alone. It needs access to a computing cluster (“cloud” or “HPC” resources), set up by data managers.
-- Dask ensures the process is robust: if one “worker” fails or needs a break, the others continue, and the task gets finished.
-- This is similar to how weather agencies run large climate models.
-
-**Summary:** Using Dask makes massive, complex scientific estimation possible and practical, so you can have high-quality dewpoint data for modeling or decision making—even across entire countries—without waiting forever.
-## What's the science/math behind it?
+All of this is done at **high spatial resolution** (many grid cells—on the order of hundreds of thousands) and for cases where dewpoint is missing or has gaps.
 
 
-- **Climatology**: For each location and each day of the year, the tool computes the "average" dewpoint temperature (and minimum temperature) based on available historic data. This is called the daily "climatology."
-- **Anomalies**: On any day, the difference between the observed (or missing) value and this "typical" value is called the "anomaly." The tool models these anomalies instead of the raw values.
-- **Local Linear Regression Model**: For each location and each time of year, it predicts dewpoint anomalies using:
-  - The anomaly in minimum temperature for that day
-  - Recent values (from previous days) of both dewpoint and temperature anomalies
-  - A statistical technique called "weighted local linear regression" that gives more influence to data from nearby dates on the calendar (so predictions in July rely mostly on past Julys).
+## The statistical model: what we estimate and why
 
-### Math in Simple Terms
+This section is written for readers comfortable with regression. The goal is to estimate **daily dewpoint temperature** $TD$ at locations and on days where it was not measured, using minimum temperature $TMIN$ (which is far more widely recorded) plus the recent history of both variables.
 
-The tool fits an equation like this for each location and each time of year:
+### Step 1 — Remove the seasonal cycle (climatology)
+
+Dewpoint and temperature both have a strong, predictable annual cycle: a January day and a July day are not comparable. Regressing the raw values would mostly be re-discovering the calendar. So the first step is to estimate, for **each location $\,ID$** and **each day-of-year $\,doy \in \{1,\dots,366\}$**, the long-run mean over all available years:
 
 $$
-TD_{\text{anom}} \approx \text{constant} + (\text{TMIN}_{\text{anom}} \times \text{coeff}_1) + (\text{yesterday's TD}_{\text{anom}} \times \text{coeff}_2) + \ldots
+\overline{TD}(ID, doy), \qquad \overline{TMIN}(ID, doy).
 $$
 
-- "TD_anom" is the anomaly (difference from normal) in dewpoint.
-- "TMIN_anom" is the anomaly in minimum temperature.
-- There are also terms using values from one and two days earlier (lags).
+This per-location, per-day mean is the **climatology**—the "normal" value. Think of it as a location-specific seasonal baseline estimated from decades of data.
 
-By fitting these equations, the tool learns how dewpoint anomalies depend on temperature anomalies and their recent history, separately for each location and time of year.
+### Step 2 — Model the anomalies, not the raw values
 
-- **Regression weights** are highest for days closest to the day being predicted, using a "tricube" kernel—which just means points further away on the calendar matter less.
+We then subtract the baseline and work with **anomalies** (departures from normal):
+
+$$
+TD_{\text{anom}} = TD - \overline{TD}(ID, doy), \qquad
+TMIN_{\text{anom}} = TMIN - \overline{TMIN}(ID, doy).
+$$
+
+After this de-seasonalizing step, the remaining signal is "warmer/wetter than usual" vs. "cooler/drier than usual"—exactly the part that minimum temperature can help explain. This is the standard *anomaly* framing used throughout climatology.
+
+### Step 3 — A local weighted linear regression per location and season
+
+For each $(ID, doy)$ pair we fit a small **weighted least-squares (WLS)** regression with five terms:
+
+$$
+TD_{\text{anom}} \;\approx\; \beta_0
+\;+\; \beta_1\, TMIN_{\text{anom}}
+\;+\; \beta_2\, TD_{\text{anom}}^{(t-1)}
+\;+\; \beta_3\, TD_{\text{anom}}^{(t-2)}
+\;+\; \beta_4\, TMIN_{\text{anom}}^{(t-1)},
+$$
+
+where the superscripts $(t-1)$ and $(t-2)$ are **lags** (yesterday's and the day-before's anomalies). The lags capture short-term persistence: humid spells and cold snaps last several days, so recent conditions carry information about today.
+
+Two design choices make this *local* rather than one global regression:
+
+- **A window around the target day.** Only observations whose day-of-year falls within a half-width of $h = 11$ days of the target $doy$ (wrapping around the calendar, so late-December borrows from early-January) enter the fit. A model for July 15th is therefore trained mostly on early-to-late-July data across all years—not on April or November.
+- **Tricube weighting.** Within that window, observations are *weighted* by a **tricube kernel**: days right on the target get full weight, and weight falls smoothly to zero at the edge of the window. This is the same idea as LOESS smoothing—nearby points matter most. The analogy: rather than asking "what's the average relationship over the whole year," we ask "what's the relationship *right around this time of year*, leaning hardest on the closest days."
+
+The result is **one set of five coefficients $(\beta_0,\dots,\beta_4)$ for every $(ID, doy)$ pair**, plus an $R^2$. To predict a missing dewpoint, the tool re-attaches the baseline: $\widehat{TD} = \overline{TD}(ID, doy) + \widehat{TD}_{\text{anom}}$.
+
+### Why this is a *big* estimation problem
+
+This is where the statistics meets the computing. The model is not one regression—it is an enormous **family of tiny, independent regressions**. With on the order of $3\times10^5$ locations and $366$ days of the year, the tool fits roughly
+
+$$
+3\times10^5 \text{ locations} \;\times\; 366 \text{ days} \;\approx\; 1.1\times10^{8}
+$$
+
+separate $5\times5$ weighted least-squares problems. Each one is trivial on its own (a 5-parameter regression solves in microseconds), but there are *one hundred million* of them. That combination—each task tiny, the count astronomical, and every task fully independent of the others—is exactly what makes the next sections (Dask, HPC, CPU vs. GPU) necessary.
+
+## Why we parallelize: Dask and HPC
+
+A useful way to see the problem: it is **"embarrassingly parallel."** Because the regression for, say, location A on July 15th does not depend in any way on the regression for location B on March 3rd, all ~110 million fits *could* in principle be computed at the same time. Nothing forces them into a sequence. The only reason a single laptop is slow is that it has to work through them more or less one at a time.
+
+Running them one-by-one would take **weeks** on even a fast computer—and a laptop would likely run out of memory loading decades of nationwide data and crash. The work is not hard; there is just an enormous *amount* of it. This is precisely the situation where parallel computing pays off.
+
+### Dask: a manager that hands out the work
+
+**Dask** is the Python library we use to split the job up and farm it out. The mental model is an office with one manager and many workers:
+
+- We first cut the country's locations into **buckets**—contiguous groups of locations bundled together (so related data is read from disk once, not re-opened thousands of times).
+- Each bucket becomes **one Dask task**: "fit every $(ID, doy)$ regression for these locations."
+- Dask hands tasks out to a pool of **workers** running in parallel and combines the results at the end.
+
+The code (`run_bucketed_anomaly_training_dask`) is deliberately robust for long runs on shared machines:
+
+- **A sliding window of tasks in flight.** Rather than dumping all buckets on the scheduler at once, it keeps a fixed number (a `batch_size`) in progress and feeds in new ones as others finish—"a slow bucket never blocks the rest of the fleet."
+- **Failure isolation.** If one worker dies (a frequent reality on a busy cluster), that single bucket is logged and skipped while everyone else keeps going; a follow-up "patch" run cleans up the gaps.
+- **No thread fighting.** Each worker is pinned to a single math (BLAS) thread, so workers don't trip over each other competing for the same CPU cores.
+
+### HPC: where Dask actually runs
+
+A laptop has a handful of workers; we need *many*. So the tool is designed to run on **HPC (High-Performance Computing) clusters**—the kind of shared supercomputer a research institute operates, where a job is submitted to a queue (via a scheduler called **SLURM**) and granted dozens of CPU cores, or a slice of a high-end GPU, for a few hours. Our runs target the **KHIPU** cluster.
+
+What this means in practice:
+
+- The computation **does not run on a normal laptop**; it needs access to HPC resources, set up once by a data manager.
+- With a cluster, a job that would take weeks finishes in **hours**.
+- This is the same strategy national weather agencies use to run large climate models—divide the globe into pieces, compute the pieces simultaneously.
+
+## CPU vs. GPU: two ways to do the same math
+
+A central engineering question for this project is *which kind of hardware should do the 110 million fits.* We built **two computational paths that produce numerically identical results** (both use 64-bit precision; outputs match to the byte). The shared statistical model is the same—only the engine differs.
+
+### The CPU path — many workers, each steady and sequential
+
+On CPUs we use the standard, trusted route: a worker fits the regressions in its bucket **one at a time** using the well-known `statsmodels` weighted-least-squares routine. A CPU core is like a **highly skilled expert**: it does any single regression carefully and quickly, but it can only do one at a time. Speed comes from having **many experts (workers) in parallel**—on KHIPU, typically up to 32 CPU cores per job, each chewing through its own pile of buckets.
+
+### The GPU path — one device, thousands of fits at once
+
+A GPU (we target one slice of an **NVIDIA A100**) works on a completely different principle. Instead of a few skilled experts, it has **thousands of simple workers** that are only useful when they all do the *same kind* of small task simultaneously. The analogy: a CPU is a handful of PhD statisticians; a GPU is a stadium full of students each handed one tiny identical worksheet.
+
+To exploit that, the GPU path (`gpu_train.py`) does not loop over fits. It **batches** them: it assembles the ingredients for *all* ~100,000 fits in a bucket at once, then solves them together in a single fused GPU routine (a custom CUDA kernel that runs a tiny $5\times5$ Cholesky solve, one fit per GPU thread). Tens of thousands of regressions are cleared in **milliseconds** per wave.
+
+The trade-off, in plain terms:
+
+| | **CPU** | **GPU** |
+|---|---|---|
+| Style | A few expert workers, each fully independent | Thousands of simple workers in lockstep |
+| Does the fits… | One at a time per worker | Tens of thousands at once, batched |
+| Scales by adding… | More CPU cores / more machines | A wider batch on each device |
+| Best when | You can spread buckets over many cores | A single device can be kept saturated |
+
+### How we test whether the algorithm *scales*
+
+Knowing the model is "embarrassingly parallel" *in theory* is not the same as proving it speeds up *in practice*—disk reads, data shuffling, and coordination overhead can all spoil the ideal. So we built benchmark scripts (`benchmark_scaling.py`, `analyze_scaling.py`) that measure it empirically:
+
+- **Strong scaling.** Hold the problem size *fixed* and increase the number of workers $p$ over $1, 2, 4, 8, 16, 32$. We then compute **speedup** $S(p) = T(1)/T(p)$ and **efficiency** $E(p) = S(p)/p$. Perfect scaling means doubling the workers halves the time ($E \approx 1$). In reality efficiency drops once there are more workers than buckets, or once reading data from disk—not the math—becomes the bottleneck. The question strong scaling answers: *"if I throw more cores at the same job, how much faster does it actually get?"*
+- **Weak scaling.** Grow the problem size *in proportion* to the workers (twice the workers, twice the locations). If the algorithm scales well, the wall-clock time stays roughly **flat**. The question: *"if my country/dataset doubles, can I keep the runtime constant by doubling the hardware?"*
+- **GPU roofline.** For the GPU we run a separate study (`benchmark_gpu_kernel.py`, `benchmark_gpu_pipeline.py`) timing each stage of the batched solve. It confirms the pipeline is **memory-bandwidth bound**—the GPU spends its time *moving* the data rather than doing arithmetic, which is expected for such lightweight per-fit math and tells us where any future speedups would have to come from.
+
+In short, we are not just asserting the method is parallel; we are running controlled experiments across worker counts and problem sizes, on both CPU and GPU, to **measure how close to ideal the speedup is and where it breaks down.**
 
 ## What is the expected result or output if I use this? What files do I get?
 

@@ -1,37 +1,52 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "tdew-estimation"
 version = "0.1.0"
-description = "Add your description here"
+description = "Bucket-year anomaly local-linear-regression pipeline for daily dewpoint (TDEW) estimation."
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
+# Core: the algorithm + the bucketed CPU runners. Light, CPU-only, installs everywhere.
 dependencies = [
-    "dask-cuda>=0.18.0",
-    "dask-jobqueue>=0.9.0",
-    "dask[distributed]>=2025.12.0",
-    "geopandas>=1.1.1",
-    "numpy>=2.3.5",
-    "pandas>=2.3.3",
-    "pyarrow>=20.0.0",
-    "rasterio>=1.4.4",
-    "statsmodels>=0.14.6",
-    "tqdm>=4.67.1",
+    "numpy>=2.0",
+    "pandas>=2.1",
+    "pyarrow>=15",
+    "statsmodels>=0.14",
+    "tqdm>=4.66",
+    "dask[distributed]>=2024.1",
 ]
 
 [project.optional-dependencies]
-# Multi-node CPU scaling on SLURM. GPU/RAPIDS deps are Linux+CUDA only and live in
-# HPC_code/requirements-gpu.txt (installed from the NVIDIA PyPI index).
+# Multi-node CPU scaling on SLURM (dask-jobqueue spawns the worker fleet).
 hpc = [
     "dask-jobqueue>=0.8.5",
 ]
-# D4 scaling-benchmark analysis/plots (matplotlib only; CPU, no RAPIDS).
+# Scaling-benchmark analysis/plots (matplotlib only).
 benchmark = [
     "matplotlib>=3.8",
 ]
-# .nc -> point-parquet extraction (PISCO download pipeline). dask + geopandas already in core.
+# Single-GPU training/benchmark (the D3 batched-WLS kernel). CUDA 12.x wheel from PyPI.
+gpu = [
+    "cupy-cuda12x>=12",
+]
+# .nc -> point-parquet extraction (PISCO download pipeline): xarray/netCDF4 for the rasters,
+# geopandas/rasterio for the potato-grid shapefile sampling. Not needed to train/benchmark.
 netcdf = [
     "xarray>=2024.0",
     "netCDF4>=1.6",
+    "geopandas>=1.0",
+    "rasterio>=1.3",
 ]
+# Future multi-GPU (dask-cuda / RAPIDS — Linux+CUDA only, NVIDIA index). Not used for one GPU.
+multigpu = [
+    "dask-cuda>=0.18.0",
+]
+
+# Only the algorithm package is installable; HPC_code/ and Local/ are run as scripts.
+[tool.setuptools]
+packages = ["tdew_estimation"]
 
 [tool.ty.environment]
 python = ".venv"

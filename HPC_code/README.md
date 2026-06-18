@@ -57,16 +57,17 @@ are identical — only the processor count `P` changes.
 
 # 1. Setup (once)
 
-**Install** (pick the extras you need):
+**Install** (Python ≥3.11; pick the extras you need):
 
 ```bash
-pip install -e .[hpc]                                    # SLURM (dask-jobqueue)
-pip install -e .[netcdf]                                 # only if you extract .nc yourself
-pip install -e .[benchmark]                              # matplotlib, for the analyze_* plots
-pip install --extra-index-url=https://pypi.nvidia.com \
-    -r HPC_code/requirements-gpu.txt                     # GPU (Linux, CUDA 12.x)
+pip install -e ".[hpc,benchmark]"     # core + SLURM (dask-jobqueue) + plots — the CPU jobs
+pip install -e ".[gpu]"               # + cupy-cuda12x — the GPU jobs (Linux, CUDA 12.x)
+pip install -e ".[netcdf]"            # xarray/netCDF4/geopandas — only to extract .nc yourself
 mkdir -p logs    # REQUIRED: SLURM opens logs/*.out before the job body runs
 ```
+Core deps are CPU-only and light (numpy/pandas/pyarrow/statsmodels/tqdm/dask); GPU
+(`cupy`), extraction (`geopandas`/`xarray`), and multi-GPU (`dask-cuda`, `.[multigpu]`) are
+isolated in extras so a plain `pip install -e .` works anywhere.
 
 **Get the data.** Which *points* you run on is fixed when the data is extracted — pick `BASE`:
 
@@ -225,6 +226,19 @@ KHIPU limits: account `postgrado`; **32 cores, 98 GB RAM, 1 A100 MIG slice
 **run/benchmark 300k on the GPU** (~15–25 min). Strategy: **prep locally → transfer the bucketed
 inputs → 3 jobs** (each ≤ 8 h). Save all outputs under a persistent path (`$OUT=…/results`),
 never `/tmp`.
+
+### 0. One-time KHIPU setup
+```bash
+git clone https://github.com/CENTRO-INTERNACIONAL-DE-LA-PAPA/tdew_estimation.git
+cd tdew_estimation && git checkout develop
+module load python/3.11           # 3.11+ (adjust to KHIPU's module name)
+python3 -m venv .venv && source .venv/bin/activate && pip install -U pip
+pip install -e ".[hpc,benchmark]"  # CPU/SLURM + plots
+pip install -e ".[gpu]"            # cupy-cuda12x (GPU jobs)
+```
+Then set the env line in each `sbatch` (`source .../tdew_estimation/.venv/bin/activate`) or pass
+`PYTHON=.../.venv/bin/python` to `sbatch`. KHIPU has no `$SCRATCH`; use a real path, e.g.
+`RUN=/home/$USER/tdew_run`, in place of `$OUT`/`$SCRATCH` below.
 
 ### 1. Local: subset, prep, transfer
 ```bash

@@ -1,0 +1,253 @@
+---
+title: "Estimación de TDEW en HPC — benchmark CPU vs GPU y comparación PISCOt v1.1 vs v1.2"
+subtitle: "Estudio de escalamiento y evaluación de habilidad por versión del dataset (KHIPU @ UTEC)"
+author: "Piero Palacios Bernuy — Centro Internacional de la Papa (CIP)"
+date: 2026-06-19
+lang: es
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    embed-resources: true
+    fig-cap-location: bottom
+    theme: cosmo
+  pdf:
+    toc: true
+    number-sections: true
+    fig-cap-location: bottom
+    geometry: margin=1in
+execute:
+  echo: false
+  warning: false
+---
+
+> **Divulgación (política de uso de IA del CIP).** Este informe se elaboró con la asistencia de un
+> agente de IA generativa (Claude) para la orquestación, el benchmarking y la redacción. Todos los
+> resultados numéricos provienen de ejecuciones reales en el clúster KHIPU; los hallazgos científicos
+> —en particular la comparación PISCOt v1.1 vs v1.2— **deben ser validados por un experto temático
+> antes de su publicación o uso operativo.**
+
+# Resumen ejecutivo
+
+Se evaluó el desempeño del flujo de estimación de TDEW (temperatura de punto de rocío) en el clúster
+HPC **KHIPU** de la UTEC y se compararon las dos versiones del dataset de temperatura PISCOt (v1.1 y
+v1.2) sobre un año de pronóstico reservado (held-out).
+
+- **Escalamiento en CPU.** El entrenamiento paraleliza bien hasta ~8 núcleos (eficiencia ≈ 0,70) y
+  luego se aplana al volverse **limitado por el ancho de banda de memoria**; con 32 núcleos la
+  aceleración se estanca en ~11× (eficiencia ≈ 0,34). El comportamiento es **idéntico para todos los
+  tamaños de problema** — una firma de escalamiento robusta e independiente del tamaño.
+- **Desempeño en GPU.** En una sola partición MIG de A100 (`a100_3g.20gb`) el kernel de resolución
+  alcanza ~2×10⁹ ajustes/s; el pipeline completo está **limitado por ancho de banda de memoria**
+  (HBM medido ≈ 633 GB/s, todas las etapas muy por debajo del "techo" del roofline). Entrenar el
+  dominio completo de 300 mil puntos tomó **14,7 min**.
+- **CPU vs GPU.** Para el **entrenamiento**, la GPU es ~**60× más rápida que un nodo CPU de 32 núcleos
+  a plena carga** (y ~670× un solo núcleo). El **pronóstico** es autorregresivo (intrínsecamente
+  secuencial) y la GPU **no** lo acelera.
+- **v1.1 vs v1.2.** En el pronóstico reservado de 2015, **v1.1 tiene un error marginalmente menor**
+  (RMSE 1,127 vs 1,136 — brecha de ~0,8 %) mientras que **v1.2 está mucho mejor calibrado** (sesgo
+  +0,14 vs +0,44). En la práctica, un empate en magnitud, con un compromiso real entre dispersión y
+  sesgo.
+
+**Recomendación (breve):** usar la **GPU para el entrenamiento** del modelo y la **CPU para el
+pronóstico**. Véase @sec-recommendation.
+
+---
+
+# Configuración y método {#sec-method}
+
+El flujo ajusta una regresión lineal local por (ID, día-del-año) sobre anomalías de temperatura (el
+"modelo LLR de anomalías") y luego genera un pronóstico recursivo de punto de rocío. Se ejecutaron tres
+trabajos en KHIPU:
+
+| Trabajo | Hardware | Dataset | Propósito |
+|---|---|---|---|
+| **A** | CPU (`standard`, ≤32 núcleos) | subconjunto 4 000 IDs, v1.2 | Escalamiento fuerte + débil del entrenamiento |
+| **B** | GPU (1× A100 `a100_3g.20gb` MIG) | 300 mil puntos completos, v1.2 | Roofline kernel/pipeline + modelo 300k |
+| **C** | GPU (entrena) + CPU (pronóstico) | 20 000 IDs held-out, v1.1 y v1.2 | Comparación de habilidad de pronóstico vs TD observado |
+
+El entrenamiento es numéricamente equivalente en CPU y GPU (verificado en otro lugar con máx\|Δ\| ≈
+3×10⁻¹⁵), por lo que la elección de hardware afecta la **velocidad**, no el resultado científico.
+
+---
+
+# Benchmark CPU (Trabajo A) {#sec-cpu}
+
+Escalamiento fuerte en tres tamaños (512 / 1024 / 2048 IDs), trabajadores `p ∈ {1,2,4,8,16,32}`.
+
+| N (IDs) | p=1 (s) | p=8 — S / E | p=16 — S / E | p=32 — S / E |
+|---:|---:|---:|---:|---:|
+| 512 | 1027,7 | 5,67 / 0,709 | 8,99 / 0,562 | 11,05 / 0,345 |
+| 1024 | 2033,7 | 5,63 / 0,704 | 8,97 / 0,560 | 10,94 / 0,342 |
+| 2048 | 3999,4 | 5,59 / 0,699 | 8,91 / 0,557 | 10,77 / 0,337 |
+
+: Aceleración S(p) y eficiencia E(p) del escalamiento fuerte por tamaño de problema. {#tbl-cpu}
+
+**El rendimiento de un solo núcleo es constante en ~2,0 s/ID** para los tres tamaños, por lo que el
+tiempo de cómputo es lineal en el tamaño del problema — sin anomalías de caché.
+
+::: {layout-ncol=2}
+![Tiempo de pared vs trabajadores](figs/cpu/family_time_v12_cpu_train.png){#fig-cpu-time}
+
+![Aceleración vs trabajadores](figs/cpu/family_speedup_v12_cpu_train.png){#fig-cpu-speedup}
+:::
+
+![Eficiencia paralela vs trabajadores — las tres curvas (por tamaño) casi se superponen.](figs/cpu/family_efficiency_v12_cpu_train.png){#fig-cpu-eff width=70%}
+
+**Interpretación.** La eficiencia se mantiene alta hasta ~4–8 núcleos y luego cae — no por desbalance
+de carga ni por sobrecosto fijo (un problema mayor los diluiría), sino porque todos los núcleos compiten
+por el **mismo bus de memoria**. La eficiencia de escalamiento débil con 32 núcleos (≈ 0,35) coincide
+con la de escalamiento fuerte con 32 núcleos, lo cual es la firma de una carga **limitada por ancho de
+banda de memoria**. El punto óptimo práctico es **p ≈ 8** (eficiencia ≈ 0,70); 32 núcleos dan el mejor
+tiempo de pared pero a ~⅓ de eficiencia.
+
+---
+
+# Benchmark GPU (Trabajo B) {#sec-gpu}
+
+Una partición MIG de A100 `a100_3g.20gb` (~3/7 de un A100 completo, ~20 GB).
+
+| Magnitud | Valor |
+|---|---|
+| Ancho de banda HBM medido | **633 GB/s** |
+| Pico FP64 (partición) | 4200 GFLOPS (techo AI ≈ 6,6) |
+| Mejor hilos/bloque | **32** (1,81×10⁹ ajustes/s) |
+| Rendimiento del kernel de resolución | hasta **2,09×10⁹ ajustes/s** |
+| GFLOPS de resolución @ N=1024 | 356 (aún ≪ pico → limitado por memoria) |
+| Entrenamiento completo 300k | **879,7 s (14,7 min)** |
+
+: Desempeño de la GPU en un solo dispositivo. {#tbl-gpu}
+
+## Las etapas del pipeline: assemble / convolve / solve {#sec-gpu-stages}
+
+Los gráficos de roofline y por etapa de abajo están etiquetados por las **tres etapas de GPU** que
+convierten un bucket de filas diarias crudas en coeficientes ajustados ("total" es su suma). El modelo
+es una **regresión lineal local por (ID, día-del-año)** con cinco predictores (constante, anomalía de
+TMIN, TD lag-1, TD lag-2, TMIN lag-1) → un sistema de ecuaciones normales 5×5 por ajuste; el eje x es
+M ≈ N × 366 ajustes (IDs × días-del-año).
+
+| Etapa | Qué hace | Intensidad aritmética |
+|---|---|---:|
+| **Assemble (ensamblado)** | Dispersa cada observación diaria en sus *estadísticos suficientes* por (ID, día-del-año) — la matriz 5×5 XᵀX, el vector Xᵀy, Σwy² y un conteo (32 acumuladores por celda). | AI ≈ 0,11 (limitado por memoria) |
+| **Convolve (convolución)** | Aplica la ventana de regresión local: `2h+1` desplazamientos circulares ponderados (tricube) sobre el eje día-del-año (ancho de banda h = 11 → ventana de 23 días que envuelve el año). | AI ≈ 0,08 (lo más limitado por memoria) |
+| **Solve (resolución)** | El kernel fusionado de Cholesky en registros, un hilo por ajuste — resuelve cada sistema de mínimos cuadrados ponderados 5×5 → 5 coeficientes + R². | AI ≈ 0,61 (lo más denso en cómputo) |
+| **Total** | Assemble + Convolve + Solve, de extremo a extremo por bucket. | AI ≈ 0,10 |
+
+: Las tres etapas del pipeline en GPU y su intensidad aritmética. {#tbl-stages}
+
+Las tres etapas tienen intensidad aritmética muy por debajo del techo del roofline del A100 (≈ 6,6),
+por lo que todo el pipeline está **limitado por ancho de banda de memoria, no por cómputo**. `solve`
+es la etapa más eficiente, pero mover los tensores de estadísticos suficientes en `assemble` y
+`convolve` marca el ritmo general.
+
+::: {layout-ncol=2}
+![Roofline del pipeline — todas las etapas muy por debajo del techo → limitado por ancho de banda.](figs/gpu/gpu_roofline.png){#fig-gpu-roofline}
+
+![Ajuste del tamaño de bloque — 32 hilos/bloque es óptimo en este dispositivo.](figs/gpu/gpu_block_tuning.png){#fig-gpu-block}
+:::
+
+![Rendimiento del kernel de resolución vs tamaño del problema (ajustes/s sube y se satura con M).](figs/gpu/gpu_throughput.png){#fig-gpu-throughput width=70%}
+
+**Interpretación.** Todas las etapas (ensamblado / convolución / resolución) están muy por debajo del
+techo del roofline, por lo que el kernel está **limitado por ancho de banda, no por cómputo** —
+exactamente lo esperado para estos pequeños sistemas lineales por ajuste. Aun así, el rendimiento bruto
+es enorme: ~2×10⁹ ajustes/s, y todo el dominio de 300 mil puntos se entrena en menos de 15 minutos.
+
+---
+
+# CPU vs GPU {#sec-cpuvsgpu}
+
+![Costo de entrenamiento por ID (escala log, menor es mejor). Derivado del Trabajo A (CPU ~2,0 s/ID con 1 núcleo, 11× con 32 núcleos) y de la corrida GPU de 300k (879,7 s / 302 449 IDs). El costo por-ID es la única base equivalente aquí, ya que los benchmarks de CPU y GPU corrieron en tamaños de problema distintos.](figs/gpu/cpu_vs_gpu_per_id.png){#fig-cpuvsgpu width=85%}
+
+Combinando ambos benchmarks en términos de **costo de entrenamiento por ID**:
+
+| Configuración | Costo por ID (entrenamiento) | Relativo |
+|---|---:|---:|
+| CPU, 1 núcleo | ~2,0 s | 1× |
+| CPU, 32 núcleos | ~0,18 s | ~11× |
+| **GPU (A100 MIG)** | **~0,0029 s** | **~670×** |
+
+: Rendimiento de entrenamiento, derivado del Trabajo A (CPU ~2,0 s/ID, 11× con 32 núcleos) y de la
+corrida GPU de 300k (879,7 s / 302 449 IDs). {#tbl-cpuvsgpu}
+
+Así, para el **entrenamiento**, la GPU es **~60× más rápida que un nodo CPU de 32 núcleos a plena carga**.
+
+**Pero el pronóstico es distinto.** El pronóstico de punto de rocío es **autorregresivo**: el TD
+predicho de cada día alimenta las variables rezagadas (lags) del día siguiente, por lo que el eje
+temporal es irreduciblemente secuencial — no se puede vectorizar ni paralelizar sobre los días, y es
+Python/pandas puro, así que la **GPU no aporta beneficio**. En el Trabajo C el pronóstico de 20 000 IDs
+para un año tomó ~1 h 55 m con o sin GPU. El único eje paralelo que queda para el pronóstico es **entre
+IDs independientes** (trabajadores de CPU).
+
+---
+
+# PISCOt v1.1 vs v1.2 (Trabajo C) {#sec-compare}
+
+Pronóstico reservado de 2015, 20 000 IDs, ~7,3 M de valores diarios evaluados contra TD observado.
+
+| corrida | RMSE | MAE | sesgo (pred−obs) | r de Pearson | coseno |
+|---|---:|---:|---:|---:|---:|
+| **v1.1** | **1,127** | **0,844** | +0,443 | **0,9823** | 0,9926 |
+| **v1.2** | 1,136 | 0,867 | **+0,143** | 0,9787 | 0,9921 |
+
+: Habilidad global del pronóstico vs punto de rocío observado. ΔRMSE (v1.2−v1.1) = +0,0089 (~0,8 %). {#tbl-acc}
+
+::: {layout-ncol=2}
+![RMSE mensual, v1.1 vs v1.2.](figs/cmp/monthly_rmse.png){#fig-monthly}
+
+![Mayor diferencia de coeficientes: sensibilidad a la anomalía de TMIN.](figs/cmp/delta_hist_TMIN_anom_coeff.png){#fig-tmin}
+:::
+
+::: {layout-ncol=2}
+![Predicho vs observado — v1.1.](figs/cmp/pred_vs_obs_v1.1.png){#fig-pvo11}
+
+![Predicho vs observado — v1.2.](figs/cmp/pred_vs_obs_v1.2.png){#fig-pvo12}
+:::
+
+**Coeficientes.** Ambas versiones dan cobertura idéntica (7,32 M ajustes, solapamiento total) y modelos
+muy similares. La mayor diferencia es la **sensibilidad a la anomalía de TMIN** (`TMIN_anom_coeff`:
+v1.1 = 0,452 vs v1.2 = 0,370; menor correlación, r = 0,68); v1.2 se apoya algo más en la persistencia
+autorregresiva (`TD_anom_lag1` 0,81 vs 0,78). La calidad de ajuste es casi idéntica (R² 0,787 vs 0,778).
+Las predicciones de ambas versiones concuerdan estrechamente entre sí (RMSE 0,61, r 0,9946), divergiendo
+más en septiembre–octubre.
+
+**Lectura del resultado.** v1.1 tiene RMSE/MAE marginalmente menores y mayor correlación, pero la brecha
+es ~0,8 % — prácticamente un empate en magnitud de error. v1.2, sin embargo, está **mucho mejor centrado**
+(sesgo +0,14 vs +0,44): v1.1 corre sistemáticamente cálido. Cuál versión es "mejor" depende entonces de
+si se prioriza dispersión baja (v1.1) o sesgo bajo (v1.2).
+
+::: {.callout-warning}
+## Advertencias
+1. **Se requiere validación por experto temático** antes de cualquier decisión de publicación/operativa
+   (política de IA del CIP).
+2. Es una muestra reservada de 20 000 IDs para un **único año de pronóstico (2015)**; se necesita una
+   evaluación de dominio completo y multi-año antes de fijar una preferencia de versión.
+:::
+
+---
+
+# Recomendación: ¿CPU o GPU? {#sec-recommendation}
+
+**Usar ambos, por etapa:**
+
+- **Entrenamiento (ajuste de coeficientes LLR) → GPU.** Es la parte pesada en cómputo y
+  vergonzosamente paralela, y una sola partición MIG de A100 entrena el dominio completo de 300 mil
+  puntos en ~15 min — ~60× un nodo CPU de 32 núcleos. Aquí la GPU se paga sola.
+- **Pronóstico (punto de rocío recursivo) → CPU.** Es autorregresivo/secuencial; la GPU no acelera.
+  Ejecutarlo en CPU y paralelizar **entre IDs** (series independientes), liberando la GPU.
+- **Si no hay GPU disponible**, el entrenamiento corre igual en CPU; usar **~8 núcleos para la mejor
+  eficiencia** (≈ 0,70) o hasta 32 para el mejor tiempo de pared (eficiencia ≈ 0,34, limitado por
+  ancho de banda de memoria).
+
+**Por qué:** el kernel de entrenamiento está limitado por rendimiento (throughput) y encaja a la
+perfección con el ancho de banda de la GPU; el pronóstico está limitado por latencia debido a una
+recurrencia secuencial que ninguna cantidad de paralelismo en GPU puede acortar. Asignar cada etapa al
+hardware que le conviene da el mejor pipeline global.
+
+# Reproducibilidad
+
+Los comandos completos están en `HPC_code/RUNBOOK.md`. Se requirieron dos correcciones al `sbatch` de
+KHIPU, documentadas ahí: (1) cargar el **toolkit de CUDA** para que cupy pueda compilar el kernel de GPU
+en tiempo de ejecución, y (2) pasar la **ventana de años de entrenamiento/pronóstico** al entrenador
+(sin ella el pronóstico no producía salida de forma silenciosa).

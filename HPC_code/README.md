@@ -103,8 +103,21 @@ any module-based cluster — only the module name / paths change.
    set -e
    export LD_LIBRARY_PATH=/opt/ohpc/pub/libs/gnu12/python3/3.11.11/lib:${LD_LIBRARY_PATH:-}
    ```
-4. **Walltime:** use `#SBATCH --time=07:59:00` (the `08:00:00` cap can be rejected by QOS).
-5. **Account cap = 32 cores + 1 GPU**, so the 32-core CPU job and the GPU jobs can't run together —
+4. **GPU jobs need a CUDA *toolkit*, not just `cupy`.** The solver JIT-compiles its CUDA kernel at
+   runtime (cupy `RawKernel` / NVRTC), which needs CUDA toolkit **headers** — the `cupy-cuda12x`
+   wheel ships the compiler but *not* the headers. So `train_gpu_a100.sbatch` also loads a CUDA
+   module and points `CUDA_PATH` at the toolkit root (already baked into the sbatch; the `module
+   load` alone only adds `nvcc` to PATH, it does **not** set `CUDA_PATH` on KHIPU):
+   ```bash
+   module load cuda/12.6 2>/dev/null
+   export CUDA_HOME=/opt/ohpc/pub/apps/cuda/12.6 CUDA_PATH=$CUDA_HOME   # include/ holds cuda_runtime.h
+   export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
+   ```
+   ⚠️ Without it, `MODE=benchmark` crashes with `Failed to find CUDA headers`, and — the real
+   footgun — `MODE=train` **exits 0 but writes 0 valid coefficients** (every bucket fails silently).
+   Always confirm the `coeff_rows=N failure_rows=0` line in the job log, not just the exit code.
+5. **Walltime:** use `#SBATCH --time=07:59:00` (the `08:00:00` cap can be rejected by QOS).
+6. **Account cap = 32 cores + 1 GPU**, so the 32-core CPU job and the GPU jobs can't run together —
    submit them all and the GPU jobs queue behind the CPU benchmark.
 
 # Get the data

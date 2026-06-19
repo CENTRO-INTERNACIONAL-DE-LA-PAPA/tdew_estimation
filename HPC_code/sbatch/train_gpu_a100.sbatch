@@ -45,13 +45,20 @@ mkdir -p logs
 set +e
 source /etc/profile.d/lmod.sh 2>/dev/null
 module load python3/3.11.11 2>/dev/null            # KHIPU OpenHPC module on shared /opt/ohpc
-# module load cuda/12 2>/dev/null                  # uncomment if cupy needs a CUDA module here
+module load cuda/12.6 2>/dev/null                  # cupy RawKernel JIT-compiles the GPU solve → needs a CUDA toolkit
 for _v in "${SLURM_SUBMIT_DIR:-$PWD}/.venv" "$HOME/tdew_estimation/.venv" ".venv"; do
   [ -f "$_v/bin/activate" ] && { source "$_v/bin/activate"; break; }
 done
 set -e
 _pylib=/opt/ohpc/pub/libs/gnu12/python3/3.11.11/lib
 [ -d "$_pylib" ] && export LD_LIBRARY_PATH="$_pylib:${LD_LIBRARY_PATH:-}"
+# cupy compiles the GPU solve kernel at runtime (NVRTC) → it needs CUDA toolkit *headers*, found via
+# CUDA_PATH. The `module load cuda` above only puts nvcc on PATH; point CUDA_PATH at the toolkit root
+# (its include/ symlink holds cuda_runtime.h). Guarded so it no-ops off KHIPU. WITHOUT this, every GPU
+# bucket fails with "Failed to find CUDA headers" — and MODE=train still exits 0 with 0 valid rows.
+_cuda=/opt/ohpc/pub/apps/cuda/12.6
+[ -d "$_cuda/include" ] && { export CUDA_HOME="$_cuda" CUDA_PATH="$_cuda"; \
+  export LD_LIBRARY_PATH="$_cuda/lib64:${LD_LIBRARY_PATH:-}"; }
 PYTHON="${PYTHON:-python}"
 
 BASE="${BASE:?set BASE=/path/to/base}"

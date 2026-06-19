@@ -1,0 +1,276 @@
+---
+title: "Estimación de la temperatura de punto de rocío (TDEW)"
+subtitle: "A partir de la temperatura mínima sobre PISCOt — regresión lineal local sobre anomalías con un diseño paralelo *bucket-año*"
+author:
+  - Piero Palacios Bernuy
+  - Estuardo Oliver Campos
+  - Diego Sánchez Salazar
+  - Gianmarco Mejía
+date: 2026-06-19
+lang: es
+format:
+  revealjs:
+    theme: [white, custom.scss]
+    chalkboard: true
+    slide-number: true
+    smaller: true
+    scrollable: true
+    incremental: false
+    transition: slide
+    width: 1280
+    height: 720
+    fig-cap-location: bottom
+    code-line-numbers: false
+    center-title-slide: true
+    footer: "TDEW sobre PISCOt — Avance parcial"
+---
+
+# Introducción {.center}
+
+## ¿Qué es la temperatura de punto de rocío (TDEW)?
+
+::: {.columns}
+::: {.column width="58%"}
+- Es la temperatura a la que el aire, a presión constante, debe **enfriarse hasta saturarse** y comenzar a condensar agua.
+- Por tanto es una **medida directa del contenido de humedad** del aire y fija la presión de vapor real (balance hídrico, evapotranspiración de Penman–Monteith).
+- **Por qué importa en agricultura:** controla la **duración del período de humectación foliar** — el principal predictor del riesgo de infección por hongos y bacterias.
+:::
+::: {.column width="42%"}
+**Caso crítico: la papa en los Andes**
+
+- El **tizón tardío** (*Phytophthora infestans*) depende estrechamente de temperatura y humedad.
+- Noches frescas con **rocío abundante** + días húmedos = condiciones ideales de epidemia.
+- Los modelos de alerta de tizón se alimentan de series de TD → su calidad condiciona la gestión del cultivo.
+:::
+:::
+
+::: {.notes}
+TD = dew-point. Medirla directamente es costoso, por eso se estima a partir de variables más disponibles. Mencionar que es insumo de sistemas de alerta temprana.
+:::
+
+## ¿Qué es PISCO / PISCOt (SENAMHI)?
+
+::: {.columns}
+::: {.column width="55%"}
+- **PISCO** = *Peruvian Interpolated data of SENAMHI's Climatological and hydrological Observations*: productos grillados de clima para el Perú.
+- **PISCOt** = la familia de **temperatura del aire** (máxima y mínima).
+- v1.2: grillas **diarias a 0.01°** para todo el país, **1981–2020**.
+- Construcción en 4 etapas: control de calidad → relleno de vacíos → homogeneización → interpolación espacial.
+:::
+::: {.column width="45%"}
+**Lo que aporta — y lo que falta**
+
+- Aporta el **predictor TMIN** sobre una grilla densa y homogénea.
+- La **TD** tiene cobertura limitada e inconsistente:
+  - **v1.1** incluye TD solo hasta **2016**.
+  - **v1.2** **no incluye TD** en absoluto.
+- → Esa carencia es la que **motiva estimar TD a partir de TMIN**.
+- Comparar **v1.1 vs v1.2** evalúa cómo los cambios del producto se propagan al modelo.
+:::
+:::
+
+::: {.notes}
+Huerta et al. 2023, Scientific Data. v1.2 mejora a v1.1 con más datos y control de versiones más estricto. La meta: un campo de TD completo y homogéneo para todo el período.
+:::
+
+# El problema {.center}
+
+## El problema a resolver
+
+::: {.columns}
+::: {.column width="50%"}
+**Objetivo**
+
+Estimar la **TD diaria** para cada celda de la grilla PISCOt usando la **TMIN** como predictor principal, de forma completa y homogénea.
+
+**Escala masiva**
+
+- $N \approx 300\,000$ ubicaciones (`ID`)
+- $Y \approx 40$ años de registro diario
+- → del orden de **miles de millones** de registros por variable
+:::
+::: {.column width="50%"}
+**El reto no es solo de volumen — es estadístico**
+
+- La temperatura cruda tiene un **ciclo estacional** fuerte; modelar TD cruda vs TMIN cruda capturaría sobre todo "ambas siguen las estaciones", no el acoplamiento físico humedad–temperatura.
+- Solución: trabajar sobre **anomalías** (restar la climatología de cada `(ID, doy)`).
+- Modelar día a día por separado para cada `(ID, doy)` →
+$$N \times D \approx 300\,000 \times 366 \approx 1.1\times 10^{8}$$
+**ajustes de regresión independientes.**
+:::
+:::
+
+::: {.notes}
+Cada ajuste es diminuto, pero su número total convierte esto en un problema intensivo que exige un diseño paralelo cuidadoso → motiva el análisis de complejidad y los experimentos de escalamiento.
+:::
+
+# Metodología {.center}
+
+## Datos y variables: notación y símbolos
+
+La unidad de análisis es la celda de grilla (`ID`). Para cada `ID` y día del año `doy` se define la **climatología** (media histórica) y la **anomalía** (desviación respecto a ella):
+
+$$TD_{anom}(t) = TD(t) - TD_{clim}(ID, doy), \qquad TMIN_{anom}(t) = TMIN(t) - TMIN_{clim}(ID, doy)$$
+
+| Símbolo | Significado | Valor típico |
+|---|---|---|
+| $N$ | Número de ubicaciones espaciales (`ID`) | $\approx 300\,000$ |
+| $Y$ | Años de entrenamiento | $\approx 40$ |
+| $D$ | Días por año | $\leq 366$ |
+| $B$ | Número de *buckets* de `ID` | p. ej. 1024 |
+| $p$ | Procesadores / trabajadores | variable |
+| $h$ | Semiventana local de `doy` | 11 |
+| $F$ | Coeficientes de regresión (intercepto + predictores) | 5 |
+| $m$ | Muestras por regresión local | $O(Yh)$ |
+
+::: {.notes}
+Todo el protocolo se ejecuta idéntico sobre v1.1 y v1.2: solo cambian rutas de entrada y carpetas de salida, ningún código difiere entre ejecuciones.
+:::
+
+## Modelo de regresión lineal local
+
+::: {.columns}
+::: {.column width="52%"}
+- **Regresión lineal local ponderada**: en lugar de una recta global, ajusta un modelo lineal dentro de una **vecindad local** de cada `doy`, ponderando por cercanía.
+- **Ventana circular** de semianchura $h$ sobre el día del año (el día 365 es vecino del día 1).
+- Peso **tricube**, que decae suave a cero en el borde:
+$$w(t) = \left(1 - \left|\tfrac{\delta(doy(t),d)}{h}\right|^{3}\right)^{3}, \quad |\delta| \le h$$
+:::
+::: {.column width="48%"}
+- Predictores ($F=5$): intercepto, $TMIN_{anom}$, y rezagos $TD_{anom}^{lag1}$, $TD_{anom}^{lag2}$, $TMIN_{anom}^{lag1}$.
+- Cada ajuste resuelve los **mínimos cuadrados ponderados** (ecuaciones normales):
+$$\left(X^{\top} W X\right)\beta = X^{\top} W y$$
+- Se obtiene el vector $\beta$ de coeficientes, almacenado por `(ID, doy)`.
+- $m = O(Yh)$ muestras de vecindad por ajuste.
+:::
+:::
+
+::: {.notes}
+Cleveland 1979 (LOWESS); Fan & Gijbels 1996. Al trabajar sobre anomalías se elimina el ciclo estacional y la regresión aprende el acoplamiento físico día a día.
+:::
+
+## PRAM — pipeline completo (visión general)
+
+::: {.columns}
+::: {.column width="52%"}
+**Modelo PRAM, variante CREW**
+
+- **Lectura concurrente:** muchos procesadores leen las mismas tablas de entrada.
+- **Escritura exclusiva:** cada trabajador es dueño de un `bucket`/`ID`/`doy` de salida disjunto → sin colisiones.
+- `pardo` marca los bucles cuyas iteraciones son **independientes** (paralelizables).
+- **Diseño *bucket-año*** (`bucket = ID mod B`): agrupa y compacta los datos **una sola vez** → convierte una tormenta de lecturas diminutas en pocas lecturas secuenciales grandes.
+:::
+::: {.column width="48%"}
+**Algoritmo 1 — 9 etapas encadenadas**
+
+1. Construir **climatología**
+2–3. Construir **dataset bucket-año** + fragmentar climatología
+4. **Entrenar coeficientes** ← salida científica
+5–9. **Control de calidad**: verificar completitud y reentrenar *solo* los `doy` faltantes
+10–13. **Pronóstico** opcional (horizonte futuro)
+
+Cada etapa corre en secuencia, pero es **internamente paralela**.
+:::
+:::
+
+::: {.notes}
+JáJá 1992; Cormen et al. 2009. La consecuencia clave del bucket-año: el paralelismo efectivo de las etapas de cómputo queda acotado por el número de buckets, p_eff <= B.
+:::
+
+## PRAM — entrenamiento de coeficientes (etapa dominante)
+
+**Es la fase que domina el costo.** Por cada `ID` y `doy`: reúne la vecindad circular, descarta filas incompletas, pondera con tricube y resuelve la regresión.
+
+```bash
+TRAIN-COEFFICIENTS(bucket-year, clim, h, B)
+for each bucket b in 0..B-1  pardo          # B tareas indep.
+  read bucket-year + climatology rows
+  for each ID i in bucket b   pardo
+    compute TD_anom, TMIN_anom ; build lags
+    for each target day d in 1..366  pardo
+      N_d <- vecindad circular(|doy−d| <= h)   # completos
+      if |N_d| >= min_samples:
+        w    <- tricube(dist / h)
+        beta <- weighted_least_squares(N_d)    # (XᵀWX)β=XᵀWy
+        write coef (ID i, doy d)
+```
+
+::: {.notes}
+Cada ajuste resuelve (XᵀWX)β = XᵀWy con F=5 predictores y m=O(Yh) muestras de vecindad. Los tres bucles `pardo` (bucket, ID, día) son independientes → la complejidad va en la siguiente diapositiva.
+:::
+
+## Entrenamiento — costo y paralelismo
+
+**Costo de un ajuste** ($F=5$ constante) — lo domina el número de muestras de vecindad $m=O(Yh)$:
+$$W_{\text{1-fit}} = O(mF^{2}+F^{3}) = O(m) = O(Yh)$$
+
+**Trabajo total** = costo de un ajuste $\times\ (N \times D)$ ajustes:
+$$W_{\text{train}} = O(N\,D\,Y\,h)$$
+
+**Tiempo paralelo** ($B$ tareas de bucket, $p$ trabajadores):
+$$T_{p} = O\!\left(\frac{N\,D\,Y\,h}{\min(p,B)} + \text{sobrecosto de E/S}\right)$$
+
+**Span** (procesadores ilimitados): $T_{\infty}=O(\log m + F^{3})$ → algoritmo extremadamente **"ancho"** (altamente paralelo); el paralelismo efectivo queda acotado por los buckets, $p_{\text{eff}} \le B$.
+
+## Complejidad global del algoritmo
+
+**Trabajo total** (con $R = N\,Y\,D$) — el factor $h$ de la regresión local es el multiplicador dominante:
+$$W_{\text{total}} = O\!\left(R\log\tfrac{ND}{B} + N D Y h\right) = O(N D Y h)$$
+
+| Fase | Trabajo $W$ | Tiempo paralelo $T_p$ |
+|---|---|---|
+| Climatología | $O(R)$ | $O(R/p + \log R)$ |
+| Dataset bucket-año | $O(R\log(ND/B))$ | $O(R/p + \log(ND/B))$ |
+| **Entrenar coeficientes** | $O(NDYh)$ | $O(NDYh / \min(p,B))$ |
+| Verificar completitud | $O(ND)$ | $O(ND/p + \log ND)$ |
+| Reparar $Q$ DOYs | $O(NQYh)$ | $O(NQYh / \min(p,B))$ |
+| Pronóstico (horizonte $H$) | $O(NH)$ | $O(NH / \min(p,B) + H)$ |
+
+- Cómputo escala con $\min(p,B)$ → $p_{\text{eff}} \le B$; regla práctica **$B \ge 4p$**.
+- El bucket-año **no** reduce el trabajo estadístico; elimina la **E/S repetida** ($O(NS)\!\to\!O(S)$). El **$+H$** del pronóstico es su recursión secuencial por `ID`.
+
+::: {.notes}
+El trabajo total no depende de p: mide el cómputo intrínseco. El hardware (CPU o GPU) solo cambia p_eff y la constante c en T_p = c·W/p_eff + sobrecosto. Memoria pico por compactación bucket-año: O(ND/B).
+:::
+
+# Experimentos {.center}
+
+## Implementación y experimentos planeados
+
+::: {.columns}
+::: {.column width="50%"}
+**Implementación (Dask)**
+
+- **CPU:** `SLURMCluster` — 1 trabajador = 1 proceso de un hilo (BLAS fijado a 1).
+- **GPU:** `dask-cuda` — 1 trabajador = 1 **A100**; kernel CUDA propio (Cholesky $5\times5$, lotes de $\sim 10^{5}$).
+- $p$ = trabajadores **independientes** (núcleos en CPU, GPUs en GPU).
+
+**Métricas** (problema fijo, $T(p)$ = tiempo de reloj):
+$$S(p)=\tfrac{T(1)}{T(p)}, \quad E(p)=\tfrac{S(p)}{p}$$
+
+Curvas reportadas: **Tiempo $T(p)$**, **aceleración $S(p)$** y **eficiencia $E(p)$** vs $p$.
+:::
+::: {.column width="50%"}
+**Diseño experimental**
+
+- **Escalamiento fuerte** (problema fijo, variar $p$):
+  - CPU: $p \in \{1,2,4,8,16,32\}$
+  - GPU: $p \in \{1,2,4,8\}$ A100
+  - Esperado: casi lineal si $p \le B$, luego se aplana.
+- **Escalamiento débil** ($n(p)=n_0 p$): $E_{weak}=T(1,n_0)/T(p,n_0p)$.
+- **Ambas versiones** (v1.1 y v1.2): se compara rendimiento **y** ciencia.
+- **Controles:** base 1 hilo; $B \ge 4p$; $k{=}3$ ensayos; caché caliente/fría.
+:::
+:::
+
+::: {.notes}
+El análisis PRAM predice que la eficiencia se mantiene alta mientras p <= B y luego se degrada (ancho de banda de E/S, planificador, dependencias). El escalamiento fuerte expone el techo p_eff <= B; el débil aísla el sobrecosto que crece con el número de trabajadores.
+:::
+
+## Gracias {.center}
+
+**Estimación de TDEW sobre PISCOt** — regresión lineal local sobre anomalías + diseño paralelo *bucket-año*, analizado en PRAM (CREW) y evaluado con escalamiento fuerte/débil en CPU y GPU A100, sobre PISCOt v1.1 y v1.2.
+
+::: {.notes}
+Divulgación: material de apoyo preparado con asistencia de IA generativa; los resultados científicos requieren validación de un experto temático (política de uso de IA del CIP).
+:::

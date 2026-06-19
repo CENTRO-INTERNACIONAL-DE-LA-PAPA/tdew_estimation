@@ -1,5 +1,6 @@
 # rendered outputs — regenerate with `quarto render`
 *.html
 *.pdf
+!TDEW_Avance_Parcial.pdf
 *_files/
 .quarto/

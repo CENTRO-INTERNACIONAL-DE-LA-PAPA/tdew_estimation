@@ -119,6 +119,28 @@ Una partición MIG de A100 `a100_3g.20gb` (~3/7 de un A100 completo, ~20 GB).
 
 : Desempeño de la GPU en un solo dispositivo. {#tbl-gpu}
 
+## Las etapas del pipeline: assemble / convolve / solve {#sec-gpu-stages}
+
+Los gráficos de roofline y por etapa de abajo están etiquetados por las **tres etapas de GPU** que
+convierten un bucket de filas diarias crudas en coeficientes ajustados ("total" es su suma). El modelo
+es una **regresión lineal local por (ID, día-del-año)** con cinco predictores (constante, anomalía de
+TMIN, TD lag-1, TD lag-2, TMIN lag-1) → un sistema de ecuaciones normales 5×5 por ajuste; el eje x es
+M ≈ N × 366 ajustes (IDs × días-del-año).
+
+| Etapa | Qué hace | Intensidad aritmética |
+|---|---|---:|
+| **Assemble (ensamblado)** | Dispersa cada observación diaria en sus *estadísticos suficientes* por (ID, día-del-año) — la matriz 5×5 XᵀX, el vector Xᵀy, Σwy² y un conteo (32 acumuladores por celda). | AI ≈ 0,11 (limitado por memoria) |
+| **Convolve (convolución)** | Aplica la ventana de regresión local: `2h+1` desplazamientos circulares ponderados (tricube) sobre el eje día-del-año (ancho de banda h = 11 → ventana de 23 días que envuelve el año). | AI ≈ 0,08 (lo más limitado por memoria) |
+| **Solve (resolución)** | El kernel fusionado de Cholesky en registros, un hilo por ajuste — resuelve cada sistema de mínimos cuadrados ponderados 5×5 → 5 coeficientes + R². | AI ≈ 0,61 (lo más denso en cómputo) |
+| **Total** | Assemble + Convolve + Solve, de extremo a extremo por bucket. | AI ≈ 0,10 |
+
+: Las tres etapas del pipeline en GPU y su intensidad aritmética. {#tbl-stages}
+
+Las tres etapas tienen intensidad aritmética muy por debajo del techo del roofline del A100 (≈ 6,6),
+por lo que todo el pipeline está **limitado por ancho de banda de memoria, no por cómputo**. `solve`
+es la etapa más eficiente, pero mover los tensores de estadísticos suficientes en `assemble` y
+`convolve` marca el ritmo general.
+
 ::: {layout-ncol=2}
 ![Roofline del pipeline — todas las etapas muy por debajo del techo → limitado por ancho de banda.](figs/gpu/gpu_roofline.png){#fig-gpu-roofline}
 

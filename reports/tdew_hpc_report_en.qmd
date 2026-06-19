@@ -113,6 +113,26 @@ Single A100 MIG slice `a100_3g.20gb` (~3/7 of a full A100, ~20 GB).
 
 : GPU single-device performance. {#tbl-gpu}
 
+## The pipeline stages: assemble / convolve / solve {#sec-gpu-stages}
+
+The roofline and per-stage plots below are labelled by the **three GPU stages** that turn a bucket of
+raw daily rows into fitted coefficients ("total" is their sum). The model is a **per-(ID, day-of-year)
+local linear regression** with five predictors (constant, TMIN anomaly, TD lag-1, TD lag-2, TMIN
+lag-1) → a 5×5 normal-equation system per fit; the x-axis is M ≈ N × 366 fits (IDs × days-of-year).
+
+| Stage | What it does | Arithmetic intensity |
+|---|---|---:|
+| **Assemble** | Scatters each daily observation into its (ID, day-of-year) *sufficient statistics* — the 5×5 XᵀX matrix, the Xᵀy vector, Σwy² and a count (32 accumulators per cell). | AI ≈ 0.11 (memory-bound) |
+| **Convolve** | Applies the local-regression window: `2h+1` tricube-weighted circular rolls over the day-of-year axis (bandwidth h = 11 → a 23-day window that wraps around the year). | AI ≈ 0.08 (most memory-bound) |
+| **Solve** | The fused one-thread-per-fit in-register Cholesky kernel — solves each 5×5 weighted least-squares system → 5 coefficients + R². | AI ≈ 0.61 (most compute-dense) |
+| **Total** | Assemble + Convolve + Solve, end-to-end per bucket. | AI ≈ 0.10 |
+
+: The three GPU pipeline stages and their arithmetic intensity. {#tbl-stages}
+
+All three stages have arithmetic intensity far below the A100 roofline ridge (≈ 6.6), so the whole
+pipeline is **memory-bandwidth bound, not compute bound**. `solve` is the most efficient stage, but
+moving the sufficient-statistics tensors in `assemble` and `convolve` sets the overall pace.
+
 ::: {layout-ncol=2}
 ![Pipeline roofline — every stage sits well below the ridge → memory-bandwidth bound.](figs/gpu/gpu_roofline.png){#fig-gpu-roofline}
 

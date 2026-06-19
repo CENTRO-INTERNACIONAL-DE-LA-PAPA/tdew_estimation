@@ -1,0 +1,5 @@
+# rendered outputs — regenerate with `quarto render`
+*.html
+*.pdf
+*_files/
+.quarto/

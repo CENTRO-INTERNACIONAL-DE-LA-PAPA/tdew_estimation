@@ -108,6 +108,9 @@ else
     --cluster local --gpu-train --gpu-block "$GPU_BLOCK" \
     --n-workers 1 --batch-size "${BATCH_SIZE:-64}" \
     --local-dir "$SCRATCH" \
+    ${TRAIN_START:+--train-start "$TRAIN_START"} ${TRAIN_END:+--train-end "$TRAIN_END"} \
+    ${PRED_START:+--pred-start "$PRED_START"} ${PRED_END:+--pred-end "$PRED_END"} \
+    ${HISTORY_END:+--history-end "$HISTORY_END"} ${TMIN_VAR:+--tmin-var "$TMIN_VAR"} \
     ${BUCKET_IDS:+--bucket-ids "$BUCKET_IDS"} \
     ${FORECAST:+--forecast}
   # Future multi-GPU (needs dask-cuda / RAPIDS conda, P>1 GPUs):

@@ -116,8 +116,16 @@ any module-based cluster — only the module name / paths change.
    ⚠️ Without it, `MODE=benchmark` crashes with `Failed to find CUDA headers`, and — the real
    footgun — `MODE=train` **exits 0 but writes 0 valid coefficients** (every bucket fails silently).
    Always confirm the `coeff_rows=N failure_rows=0` line in the job log, not just the exit code.
-5. **Walltime:** use `#SBATCH --time=07:59:00` (the `08:00:00` cap can be rejected by QOS).
-6. **Account cap = 32 cores + 1 GPU**, so the 32-core CPU job and the GPU jobs can't run together —
+5. **Pass the train/predict year window via env** (`MODE=train`): the sbatch forwards
+   `TRAIN_START`/`TRAIN_END`/`PRED_START`/`PRED_END`/`HISTORY_END`/`TMIN_VAR` to `run_training_hpc.py`.
+   If you omit them it falls back to the script defaults (`--pred-start 2017 --pred-end 2020`,
+   `--history-end = --train-end`), so a dataset with a different window (e.g. forecast 2015) produces
+   **empty predictions** — every bucket "empty", no `*.parquet`. Verify with
+   `find $RESULTS/predictions -name '*.parquet' | wc -l` > 0.
+6. **Walltime:** use `#SBATCH --time=07:59:00` (the `08:00:00` cap can be rejected by QOS). The
+   autoregressive forecast is sequential and slow (~2 h for a 20k-ID / 1-yr run) — don't trust the
+   2 h default for any real forecast.
+7. **Account cap = 32 cores + 1 GPU**, so the 32-core CPU job and the GPU jobs can't run together —
    submit them all and the GPU jobs queue behind the CPU benchmark.
 
 # Get the data

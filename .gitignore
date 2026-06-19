@@ -32,6 +32,11 @@ env/
 .conda/
 *.conda
 
+# Agents
+.claude
+.codex
+.agents
+
 # Jupyter / notebooks
 .ipynb_checkpoints/
 .notebook/

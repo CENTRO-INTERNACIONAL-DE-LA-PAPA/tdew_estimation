@@ -106,8 +106,8 @@ any module-based cluster — only the module name / paths change.
 4. **GPU jobs need a CUDA *toolkit*, not just `cupy`.** The solver JIT-compiles its CUDA kernel at
    runtime (cupy `RawKernel` / NVRTC), which needs CUDA toolkit **headers** — the `cupy-cuda12x`
    wheel ships the compiler but *not* the headers. So `train_gpu_a100.sbatch` also loads a CUDA
-   module and points `CUDA_PATH` at the toolkit root (already baked in; `module load` alone only adds
-   `nvcc` to PATH, it does **not** set `CUDA_PATH` on KHIPU):
+   module and points `CUDA_PATH` at the toolkit root (already baked into the sbatch; the `module
+   load` alone only adds `nvcc` to PATH, it does **not** set `CUDA_PATH` on KHIPU):
    ```bash
    module load cuda/12.6 2>/dev/null
    export CUDA_HOME=/opt/ohpc/pub/apps/cuda/12.6 CUDA_PATH=$CUDA_HOME   # include/ holds cuda_runtime.h

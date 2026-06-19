@@ -150,7 +150,7 @@ trains in under 15 minutes.
 
 # CPU vs GPU {#sec-cpuvsgpu}
 
-![End-to-end CPU-vs-GPU (training).](figs/gpu/cpu_vs_gpu.png){#fig-cpuvsgpu width=65%}
+![Per-ID training cost (log scale, lower is better). Derived from Job A (CPU ~2.0 s/ID at 1 core, 11× at 32 cores) and the 300k GPU run (879.7 s / 302 449 IDs). Per-ID cost is the only apples-to-apples basis here, since the CPU and GPU benchmarks ran on different problem sizes.](figs/gpu/cpu_vs_gpu_per_id.png){#fig-cpuvsgpu width=85%}
 
 Combining the two benchmarks on a **per-ID training cost** basis:
 

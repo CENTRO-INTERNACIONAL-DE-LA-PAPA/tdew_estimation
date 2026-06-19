@@ -158,7 +158,7 @@ es enorme: ~2×10⁹ ajustes/s, y todo el dominio de 300 mil puntos se entrena e
 
 # CPU vs GPU {#sec-cpuvsgpu}
 
-![CPU-vs-GPU de extremo a extremo (entrenamiento).](figs/gpu/cpu_vs_gpu.png){#fig-cpuvsgpu width=65%}
+![Costo de entrenamiento por ID (escala log, menor es mejor). Derivado del Trabajo A (CPU ~2,0 s/ID con 1 núcleo, 11× con 32 núcleos) y de la corrida GPU de 300k (879,7 s / 302 449 IDs). El costo por-ID es la única base equivalente aquí, ya que los benchmarks de CPU y GPU corrieron en tamaños de problema distintos.](figs/gpu/cpu_vs_gpu_per_id.png){#fig-cpuvsgpu width=85%}
 
 Combinando ambos benchmarks en términos de **costo de entrenamiento por ID**:
 

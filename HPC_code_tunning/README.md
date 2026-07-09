@@ -258,8 +258,11 @@ per zone), `--id-chunk` (GPU memory), `--h-grid`, `--candidates`, `--granularity
 
 ## Outputs
 
-* `manifest.parquet` — `[zone_id, zone_label, doy, h, feature_list, n_features, skill]`
-  (one row per `zone × doy`, or per zone with `doy = -1` when `--granularity zone`).
+* `manifest.parquet` — `[zone_id, zone_label, doy, h, feature_list, n_features, skill,
+  skill_baseline, skill_uplift]` (one row per `zone × doy`, or per zone with `doy = -1` when
+  `--granularity zone`). `skill_baseline` is the production fixed-5/`h=11` model scored by the
+  same LOYOCV cosine, and `skill_uplift = skill − skill_baseline` — the direct
+  tuned-vs-baseline gain that gates whether the full training + forecast (P6) are worth it.
 * `zoned_coeffs/id_bucket=*/coeffs.parquet` — **tidy/long** coefficients
   `[ID, zone_id, doy, feature_name, coeff, r_squared_anom, h]`.
 

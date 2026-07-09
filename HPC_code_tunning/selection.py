@@ -33,7 +33,7 @@ from tdew_estimation.bucket_layout import bucket_dir, bucket_for_id, discover_bu
 from tdew_estimation.parquet_io import as_path, read_parquet_any
 
 from .assemble_generic import DOY_AXIS, assemble_from_feature_frame
-from .feature_spec import FeatureRegistry, TuningConfig, build_feature_frame
+from .feature_spec import CANONICAL_FEATURES, FeatureRegistry, TuningConfig, build_feature_frame
 from .loyocv import (
     ConvolvedChunk,
     accumulate_segment_sums,
@@ -300,11 +300,33 @@ def select_zone(
             int(np.isfinite(skills).sum()),
         )
 
+    # Baseline: the production fixed-5 recipe at the fixed production h, scored by the SAME
+    # LOYOCV cosine, so the manifest shows tuned-vs-baseline uplift directly. Requires all 5
+    # canonical features to be in the candidate pool (else left NaN).
+    baseline_skill = np.full(n_units, np.nan)
+    canon = tuple(sorted(
+        registry.index(f) for f in CANONICAL_FEATURES if f in registry.feature_cols
+    ))
+    if len(canon) == len(CANONICAL_FEATURES):
+        cos = _evaluate_subsets(
+            frames, registry, [canon],
+            h=int(tuning.base.h), kernel=tuning.base.kernel,
+            min_samples=tuning.base.min_samples, year_values=year_values,
+        )[canon]
+        baseline_skill = _unit_skill(cos, tuning.granularity)
+        logger.info(
+            "zone %s baseline (fixed-5, h=%d): median skill=%.4f",
+            zone_id, int(tuning.base.h),
+            float(np.nanmedian(baseline_skill)) if np.isfinite(baseline_skill).any() else float("nan"),
+        )
+
     rows = []
     for u in range(n_units):
         if not np.isfinite(best_skill[u]):
             continue
         feats = [registry.feature_cols[i] for i in sorted(best_sets[u])]
+        base_u = float(baseline_skill[u]) if np.isfinite(baseline_skill[u]) else float("nan")
+        uplift = float(best_skill[u] - base_u) if np.isfinite(base_u) else float("nan")
         rows.append(
             {
                 "zone_id": int(zone_id),
@@ -314,6 +336,8 @@ def select_zone(
                 "feature_list": ",".join(feats),
                 "n_features": len(feats),
                 "skill": float(best_skill[u]),
+                "skill_baseline": base_u,
+                "skill_uplift": uplift,
             }
         )
     return pd.DataFrame(rows)
@@ -351,6 +375,7 @@ def run_selection(
         parts.append(part)
     if not parts:
         return pd.DataFrame(
-            columns=["zone_id", "zone_label", "doy", "h", "feature_list", "n_features", "skill"]
+            columns=["zone_id", "zone_label", "doy", "h", "feature_list", "n_features",
+                     "skill", "skill_baseline", "skill_uplift"]
         )
     return pd.concat(parts, ignore_index=True)

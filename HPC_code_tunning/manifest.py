@@ -18,7 +18,8 @@ import pandas as pd
 
 from .selection import ALL_DOYS
 
-MANIFEST_COLUMNS = ["zone_id", "zone_label", "doy", "h", "feature_list", "n_features", "skill"]
+MANIFEST_COLUMNS = ["zone_id", "zone_label", "doy", "h", "feature_list", "n_features",
+                    "skill", "skill_baseline", "skill_uplift"]
 
 
 def write_manifest(manifest: pd.DataFrame, path: str | Path) -> Path:

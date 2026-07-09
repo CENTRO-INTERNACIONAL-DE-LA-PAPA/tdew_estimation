@@ -303,4 +303,108 @@ GPU tests skip automatically when no CUDA device is present. Run with the projec
 * `test_selection_smoke.py` — planted signal kept, noise decoy dropped.
 * `test_zone_mask_solve.py` — zero-column masked solve == reduced sub-block solve.
 * `test_train_zoned_e2e.py` — manifest → single zoned pass → tidy coeffs, values pinned.
+
+## Appendix — full national-grid run (workstation, step by step)
+
+The on-disk PISCO data at `/media/ppalacios/Data1/henry_simcast_peru` is the **potato subset
+(302k IDs)**. The full ~2M-point national grid is re-extracted from the raw `.nc` in that
+base's `_raw/` (no re-download) into a **separate** base so the potato data is untouched.
+Data1 has the room (~2.3 TB free); the full extraction is ~250 GB + ~250 GB bucketed.
+
+> Single RTX A2000 → train with `--cluster none` (in-process). **Do not use `--cluster cuda`**
+> — `dask-cuda` is broken in this `.venv`. Run each heavy phase in the background and watch
+> its log with `tail -f`.
+
+### Setup (paste once per shell)
+
+```bash
+cd /home/ppalacios/Documents/tdew_estimation
+PY=$PWD/.venv/bin/python
+RAW=/media/ppalacios/Data1/henry_simcast_peru/_raw      # existing raw .nc (td, tmin_v12)
+FULL=/media/ppalacios/Data1/henry_simcast_peru_full     # NEW base (won't touch the potato data)
+RES=$FULL/results_tuning                                # bucketed inputs land here
+ZIP=$HOME/Downloads/clasif_clima_peru.zip               # SENAMHI zones
+mkdir -p "$FULL"
 ```
+
+### Phase 1 — extract the full grid (~250 GB, multi-hour)
+
+`--no-peru-potato` keeps every PISCO cell and writes `grid_index.parquet` (needed for zones).
+
+```bash
+nohup $PY HPC_code/nc_to_point_parquet.py --var td \
+    --nc-dir "$RAW/td" --base "$FULL" --no-peru-potato --year-range 1981,2016 \
+    > "$FULL/extract_td.log" 2>&1 &
+nohup $PY HPC_code/nc_to_point_parquet.py --var tmin_v12 \
+    --nc-dir "$RAW/tmin_v12" --base "$FULL" --no-peru-potato --year-range 1981,2016 \
+    > "$FULL/extract_tmin.log" 2>&1 &
+wait
+
+# verify (~2M cells + a grid_index):
+$PY - <<PY
+import pandas as pd
+gi = pd.read_parquet("$FULL/td/Outputs/grid_index.parquet")
+print("grid cells:", len(gi), "| cols:", list(gi.columns))
+PY
+```
+
+### Phase 2 — bucket the inputs (multi-hour)
+
+```bash
+nohup $PY HPC_code/prep_inputs.py \
+    --base "$FULL" --results "$RES" \
+    --td-var td --tmin-var tmin_v12 \
+    --train-start 1981 --train-end 2016 --no-future \
+    --num-buckets 8192 --n-workers 16 \
+    > "$FULL/prep.log" 2>&1 &
+wait
+
+ls "$RES"/bucketed_training_data/ | head
+ls "$RES"/climatology_by_bucket/ | head
+```
+
+`--n-workers` = CPU cores (use `$(nproc)` minus a few); `--num-buckets 8192` keeps each
+bucket ~244 IDs so training fits the 12 GB GPU.
+
+### Phase 3 — selection first (the go/no-go, ~hours, single GPU)
+
+```bash
+nohup $PY -m HPC_code_tunning.run_tuning_hpc \
+    --base "$RES" \
+    --coords "$FULL/td/Outputs/grid_index.parquet" \
+    --zones-zip "$ZIP" \
+    --tmin-var tmin_v12 --train-years "1981 2016" \
+    --per-zone-n 2000 --id-chunk 96 --h-grid 7,11,15,21 \
+    --granularity doy --stage select \
+    > "$FULL/select.log" 2>&1 &
+wait
+
+# read the uplift — this is the decision point:
+$PY - <<PY
+import pandas as pd
+m = pd.read_parquet("$RES/tuning/manifest.parquet")
+print("recipes:", len(m), "| zones:", m.zone_id.nunique())
+print("median tuned    :", round(m.skill.median(), 4))
+print("median baseline :", round(m.skill_baseline.median(), 4))
+print("median UPLIFT   :", round(m.skill_uplift.median(), 4))
+print("share zone×doy uplift>0.01:", round((m.skill_uplift > 0.01).mean(), 3))
+PY
+```
+
+If the uplift is meaningful → Phase 4. If it's ~0 → tuning doesn't help; skip the full
+training and the P6 forecast work.
+
+### Phase 4 — full-grid training (only if the uplift justifies it; multi-hour)
+
+```bash
+nohup $PY -m HPC_code_tunning.run_tuning_hpc \
+    --base "$RES" \
+    --tmin-var tmin_v12 --train-years "1981 2016" \
+    --stage train --cluster none --overwrite \
+    > "$FULL/train.log" 2>&1 &
+wait
+```
+
+Outputs: `$RES/tuning/zoned_coeffs/id_bucket=*/coeffs.parquet` (tidy). Turning those into an
+actual TD field still needs P6 (`forecast.py` generalization) — again, only worth it if
+Phase 3's uplift is real.

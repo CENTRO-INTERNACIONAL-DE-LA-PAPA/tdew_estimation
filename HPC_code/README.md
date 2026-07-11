@@ -174,6 +174,16 @@ for V in v11 v12; do python HPC_code/prep_inputs.py --base "$BASE/cmp20k" --resu
     --num-buckets 512 --n-workers 24 ; done
 ```
 
+**Sizing `--n-workers` (peak RAM):** each worker builds one year and holds ~1 month of merged
+TD+TMIN in memory at a time, so peak RAM ≈ `n_workers × month_size`. A month scales with the
+number of IDs: ~0.5 GB on the 300k-ID domain (so `--n-workers 24` is safe on a 64 GB node) but
+**~12–15 GB on the full 2.8M-ID national grid** — there use `--n-workers ≈ RAM_GB / 15`
+(e.g. **4 workers on a 125 GB workstation**, observed ~43 GB peak; 8+ workers OOM-killed).
+The sequential stages are also grid-bound: on the full grid the climatology (stage 1) and the
+climatology shard (stage 3) peak at ~50–66 GB in a single process regardless of `--n-workers`.
+If a run dies mid-way, just re-run the same command: stage 1 is skipped when
+`daily_climatology.parquet` exists, and stage 2 skips years with `.done_{year}` markers.
+
 ## A2 · Transfer to the HPC — *only if you prepped on another machine*
 
 If you prep locally and run on KHIPU, ship the bucketed inputs (skip this if you prep on the HPC):

@@ -136,11 +136,17 @@ def prep(
     clim_path = results / "daily_climatology.parquet"
     bucket_dir_out = results / "bucketed_training_data"
 
-    log.info("[prep] 1/4 climatology %s (%s)", train_year_range, tmin_var)
-    calculate_and_save_climatology_chunked(
-        train_year_range, base, clim_path,
-        td_var=td_var, tmin_var=tmin_var, outputs_subdir=outputs_subdir,
-    )
+    if clim_path.exists() and not overwrite:
+        log.info(
+            "[prep] 1/4 climatology — reusing existing %s (pass --overwrite to rebuild)",
+            clim_path,
+        )
+    else:
+        log.info("[prep] 1/4 climatology %s (%s)", train_year_range, tmin_var)
+        calculate_and_save_climatology_chunked(
+            train_year_range, base, clim_path,
+            td_var=td_var, tmin_var=tmin_var, outputs_subdir=outputs_subdir,
+        )
 
     if n_workers and n_workers > 1:
         _parallel_bucket_build(

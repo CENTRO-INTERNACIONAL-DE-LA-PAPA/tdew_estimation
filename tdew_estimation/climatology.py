@@ -141,6 +141,39 @@ def _ensure_parent_dir(p: Path) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
 
 
+def _global_max_id(files, *, logger: Optional[logging.Logger] = None) -> int:
+    """Largest ID across the given parquet files.
+
+    Uses parquet footer statistics (near-instant, no data read) with a fallback to
+    reading only the ``ID`` column. IDs are assumed dense 0..N-1 (grid feature order),
+    so ``max_id + 1`` is the size of the (ID, doy) accumulator.
+    """
+    import pyarrow.parquet as _pq  # noqa: PLC0415
+
+    log = logger or logging.getLogger(__name__)
+    max_id = -1
+    for p in files:
+        pf = _pq.ParquetFile(p)
+        names = list(pf.schema_arrow.names)
+        ci = names.index("ID") if "ID" in names else -1
+        got: Optional[int] = None
+        if ci >= 0:
+            try:
+                for rg in range(pf.metadata.num_row_groups):
+                    st = pf.metadata.row_group(rg).column(ci).statistics
+                    if st is not None and st.has_min_max and st.max is not None:
+                        got = int(st.max) if got is None else max(got, int(st.max))
+            except Exception:  # pragma: no cover - stats may be absent
+                got = None
+        if got is None:
+            got = int(_pq.read_table(p, columns=["ID"]).column("ID").to_numpy().max())
+        max_id = max(max_id, got)
+    if max_id < 0:
+        raise ValueError("Could not determine max ID from the provided parquet files.")
+    log.info("Global max ID across %d files: %d", len(list(files)), max_id)
+    return max_id
+
+
 def calculate_and_save_climatology_chunked(
     year_range: Tuple[int, int],
     base_path: PathLike,
@@ -202,105 +235,138 @@ def calculate_and_save_climatology_chunked(
     temp_dir = out_path.parent / temp_dir_name
     temp_dir.mkdir(parents=True, exist_ok=True)
 
-    all_years = range(start_year, end_year + 1)
+    all_years = list(range(start_year, end_year + 1))
 
-    log.info("Calculating daily climatology in yearly chunks to conserve memory...")
-    created_chunks = 0
+    # Locate every (year, month)'s TD/TMIN monthly files up front.
+    month_jobs: list = []
+    for year in all_years:
+        for month in range(1, 13):
+            month_start = pd.Timestamp(year=year, month=month, day=1)
+            next_month = (
+                pd.Timestamp(year=year + 1, month=1, day=1)
+                if month == 12
+                else pd.Timestamp(year=year, month=month + 1, day=1)
+            )
+            month_end = next_month - pd.Timedelta(days=1)
+            month_range = (
+                month_start.strftime("%Y-%m-%d"),
+                month_end.strftime("%Y-%m-%d"),
+            )
+            td_files = find_parquet_files(
+                base_path, td_var, month_range, outputs_subdir=outputs_subdir
+            )
+            tmin_files = find_parquet_files(
+                base_path,
+                tmin_var,
+                month_range,
+                outputs_subdir=outputs_subdir,
+                tmin_v1_legacy_name=True,
+            )
+            if td_files and tmin_files:
+                month_jobs.append((td_files, tmin_files))
 
-    for year in tqdm(all_years, desc="Processing Climatology by Year"):
-        chunk_file = temp_dir / f"clim_chunk_{year}.parquet"
-        if chunk_file.exists():
-            continue
-
-        date_range_chunk = (f"{year}-01-01", f"{year}-12-31")
-
-        td_files = find_parquet_files(
-            base_path, td_var, date_range_chunk, outputs_subdir=outputs_subdir
+    if not month_jobs:
+        raise FileNotFoundError(
+            f"No TD/TMIN monthly files found under {base_path} for {year_range}."
         )
-        tmin_files = find_parquet_files(
-            base_path,
-            tmin_var,
-            date_range_chunk,
-            outputs_subdir=outputs_subdir,
-            tmin_v1_legacy_name=True,
+
+    # Memory-stable aggregation via a FIXED dense accumulator keyed by a flat
+    # (ID, doy) index = ID * 366 + (doy - 1). Each month's per-slot sums/counts are
+    # scattered in with np.bincount — we never build or realign a billion-row pandas
+    # frame (that .add(fill_value=0) realign is what OOM-killed the previous approach).
+    # Peak memory is the fixed accumulator (~25 GB for the ~2M-point grid) plus one
+    # month of raw rows and one transient bincount vector.
+    import numpy as np  # noqa: PLC0415
+
+    DOY = 366
+    log.info("Scanning TD file footers for the ID range...")
+    n_ids = (
+        _global_max_id(
+            [p for td_files, _ in month_jobs for p in td_files], logger=log
         )
+        + 1
+    )
+    n_slots = n_ids * DOY
+    log.info(
+        "Climatology accumulator: n_ids=%d, slots=%d (~%.1f GB fixed)",
+        n_ids,
+        n_slots,
+        n_slots * 24 / 1e9,
+    )
 
-        if not td_files or not tmin_files:
-            continue
+    sum_td = np.zeros(n_slots, dtype=np.float64)
+    sum_tmin = np.zeros(n_slots, dtype=np.float64)
+    cnt = np.zeros(n_slots, dtype=np.int64)
 
-        # Load full year for each variable. This matches the original approach; it is
-        # why chunking by year is important for memory stability.
-        df_td_list = [pd.read_parquet(p) for p in td_files]
-        df_tmin_list = [pd.read_parquet(p) for p in tmin_files]
-        if not df_td_list or not df_tmin_list:
-            continue
-
-        df_td = pd.concat(df_td_list, ignore_index=True)
-        df_td = df_td.rename(columns={"Value": "TD"})
-        df_tmin = pd.concat(df_tmin_list, ignore_index=True)
-        df_tmin = df_tmin.rename(columns={"Value": "TMIN"})
-
-        # Merge on (FECHA, ID), same as the notebook
-        merged = cast(
-            DataFrame,
-            pd.merge(
-                cast(DataFrame, df_td),
-                cast(DataFrame, df_tmin),
-                on=["FECHA", "ID"],
-                how="inner",
-            ),
-        )
+    months_processed = 0
+    for td_files, tmin_files in tqdm(
+        month_jobs, desc="Processing Climatology by Month"
+    ):
+        df_td = pd.concat(
+            [pd.read_parquet(p, columns=["ID", "FECHA", "Value"]) for p in td_files],
+            ignore_index=True,
+        ).rename(columns={"Value": "TD"})
+        df_tmin = pd.concat(
+            [pd.read_parquet(p, columns=["ID", "FECHA", "Value"]) for p in tmin_files],
+            ignore_index=True,
+        ).rename(columns={"Value": "TMIN"})
+        merged = pd.merge(df_td, df_tmin, on=["FECHA", "ID"], how="inner")
+        del df_td, df_tmin
         if merged.empty:
             continue
 
-        merged["FECHA"] = pd.to_datetime(merged["FECHA"])
-        merged["doy"] = merged["FECHA"].dt.dayofyear
-
-        agg_sum = cast(DataFrame, merged.groupby(["ID", "doy"])[["TD", "TMIN"]].sum())
-        agg_count = cast(DataFrame, merged.groupby(["ID", "doy"])[["TD"]].count())
-        agg_count = cast(DataFrame, agg_count.rename(columns={"TD": "N"}))
-
-        # Merge on MultiIndex (ID, doy) to get TD, TMIN, N columns
-        yearly_stats_df = cast(
-            DataFrame,
-            pd.merge(
-                agg_sum,
-                agg_count,
-                left_index=True,
-                right_index=True,
-            ).reset_index(),
+        doy = pd.to_datetime(merged["FECHA"]).dt.dayofyear.to_numpy()
+        flat = merged["ID"].to_numpy(dtype=np.int64) * DOY + (doy - 1)
+        # Sequential bincount adds keep only one ~n_slots transient alive at a time.
+        sum_td += np.bincount(
+            flat, weights=merged["TD"].to_numpy(dtype=np.float64), minlength=n_slots
         )
-        yearly_stats_df.to_parquet(chunk_file, engine="pyarrow", index=False)
-        created_chunks += 1
-
-    log.info("Combining yearly statistics from disk iteratively...")
-
-    chunk_files = sorted(temp_dir.glob("clim_chunk_*.parquet"))
-    if not chunk_files:
-        raise FileNotFoundError(
-            f"No climatology chunk files were created under {temp_dir}."
+        sum_tmin += np.bincount(
+            flat, weights=merged["TMIN"].to_numpy(dtype=np.float64), minlength=n_slots
         )
+        cnt += np.bincount(flat, minlength=n_slots)
+        del merged, doy, flat
+        months_processed += 1
 
-    final_agg_df: DataFrame = DataFrame()
+    # Stream the ~1B-row result out in ID blocks so it is never one giant pandas frame.
+    import pyarrow as pa  # noqa: PLC0415
+    import pyarrow.parquet as _pq  # noqa: PLC0415
+
+    log.info("Writing climatology (streamed by ID block) to %s", out_path)
+    out_schema = pa.schema(
+        [
+            ("ID", pa.int64()),
+            ("doy", pa.int16()),
+            ("TD_clim", pa.float64()),
+            ("TMIN_clim", pa.float64()),
+        ]
+    )
+    writer = _pq.ParquetWriter(str(out_path), out_schema)
     used_chunks = 0
-
-    for f in tqdm(chunk_files, desc="Aggregating Chunks"):
-        yearly_stats_df = cast(DataFrame, pd.read_parquet(f))
-        current_agg = cast(
-            DataFrame,
-            yearly_stats_df.groupby(["ID", "doy"])[["TD", "TMIN", "N"]].sum(),
-        )
-        if final_agg_df.empty:
-            final_agg_df = current_agg
-        else:
-            final_agg_df = cast(DataFrame, final_agg_df.add(current_agg, fill_value=0))
-        used_chunks += 1
-
-    final_agg_df["TD_clim"] = final_agg_df["TD"] / final_agg_df["N"]
-    final_agg_df["TMIN_clim"] = final_agg_df["TMIN"] / final_agg_df["N"]
-    climatology_df = final_agg_df[["TD_clim", "TMIN_clim"]].reset_index()
-
-    climatology_df.to_parquet(out_path, engine=engine, index=False)
+    id_block = 200_000
+    try:
+        for id_start in range(0, n_ids, id_block):
+            id_end = min(id_start + id_block, n_ids)
+            s, e = id_start * DOY, id_end * DOY
+            c = cnt[s:e]
+            mask = c > 0
+            if not bool(mask.any()):
+                continue
+            local = np.nonzero(mask)[0]
+            ids_b = (id_start + local // DOY).astype(np.int64)
+            doy_b = (local % DOY + 1).astype(np.int16)
+            c_m = c[mask]
+            td_b = sum_td[s:e][mask] / c_m
+            tmin_b = sum_tmin[s:e][mask] / c_m
+            writer.write_table(
+                pa.table(
+                    {"ID": ids_b, "doy": doy_b, "TD_clim": td_b, "TMIN_clim": tmin_b},
+                    schema=out_schema,
+                )
+            )
+            used_chunks += 1
+    finally:
+        writer.close()
     log.info("✅ Climatology saved to %s", out_path)
 
     if cleanup:
@@ -316,6 +382,6 @@ def calculate_and_save_climatology_chunked(
         year_range=year_range,
         td_var=td_var,
         tmin_var=tmin_var,
-        created_chunks=created_chunks,
+        created_chunks=months_processed,
         used_chunks=used_chunks,
     )

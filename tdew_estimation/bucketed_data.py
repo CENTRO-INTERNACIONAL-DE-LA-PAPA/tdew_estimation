@@ -73,8 +73,11 @@ def _merge_monthly_training_inputs(
     if not td_files or not tmin_files:
         return None
 
-    df_td_list = [pd.read_parquet(p) for p in td_files]
-    df_tmin_list = [pd.read_parquet(p) for p in tmin_files]
+    # Project only the needed columns — never load the fat `source_file` string column.
+    df_td_list = [pd.read_parquet(p, columns=["ID", "FECHA", "Value"]) for p in td_files]
+    df_tmin_list = [
+        pd.read_parquet(p, columns=["ID", "FECHA", "Value"]) for p in tmin_files
+    ]
     if not df_td_list or not df_tmin_list:
         return None
 
@@ -216,29 +219,68 @@ def shard_climatology_by_bucket(
     out_dir = as_path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    climatology_df = pd.read_parquet(clim_path)
-    if climatology_df.empty:
-        raise ValueError(f"Climatology is empty: {clim_path}")
+    # Shard the (possibly ~1B-row) climatology WITHOUT pandas. Two earlier versions
+    # OOM-killed on the ~2.8M-ID national grid:
+    #   * pd.read_parquet + .map + sorted groupby  -> several full-frame copies;
+    #   * lean read + groupby(sort=False) ITERATION -> pandas' group iterator takes a
+    #     full sorted COPY of the whole frame (~123 GB observed on a 125 GB box).
+    # Pure-NumPy plan: pull the four columns as flat arrays, stable-argsort by bucket
+    # (= ID % B), reorder each column ONE AT A TIME, then write each bucket's slice
+    # directly with Arrow. Peak ~= columns (~26 GB) + sort index (~8 GB) + one
+    # column-reorder transient (~8 GB) — bounded and grid-size-proportional.
+    import numpy as np  # noqa: PLC0415
+    import pyarrow as pa  # noqa: PLC0415
+    import pyarrow.parquet as _pq  # noqa: PLC0415
 
-    climatology_df["ID"] = pd.to_numeric(
-        climatology_df["ID"], errors="coerce"
-    ).astype("Int64")
-    climatology_df = climatology_df.dropna(subset=["ID"]).copy()
-    climatology_df["ID"] = climatology_df["ID"].astype(int)
-    climatology_df["id_bucket"] = climatology_df["ID"].map(
-        lambda value: bucket_for_id(int(value), num_buckets=num_buckets)
-    )
+    _table = _pq.read_table(clim_path, columns=["ID", "doy", "TD_clim", "TMIN_clim"])
+    if _table.num_rows == 0:
+        raise ValueError(f"Climatology is empty: {clim_path}")
+    ids = _table.column("ID").to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
+    doy = _table.column("doy").to_numpy(zero_copy_only=False)
+    td_clim = _table.column("TD_clim").to_numpy(zero_copy_only=False)
+    tmin_clim = _table.column("TMIN_clim").to_numpy(zero_copy_only=False)
+    del _table
+
+    # bucket_for_id(id, B) == id % B (vectorised).
+    bucket_codes = (ids % num_buckets).astype(np.int32)
+    order = np.argsort(bucket_codes, kind="stable")
+    counts = np.bincount(bucket_codes, minlength=num_buckets)
+    offsets = np.zeros(num_buckets + 1, dtype=np.int64)
+    np.cumsum(counts, out=offsets[1:])
+    del bucket_codes
+
+    # Reorder one column at a time so only ONE full-size transient exists at once.
+    ids = ids[order]
+    doy = doy[order]
+    td_clim = td_clim[order]
+    tmin_clim = tmin_clim[order]
+    del order
 
     shards_written = 0
-    for bucket_id, bucket_df in climatology_df.groupby("id_bucket", sort=True):
+    for bucket_id in range(num_buckets):
+        s, e = int(offsets[bucket_id]), int(offsets[bucket_id + 1])
+        if s == e:
+            continue
         bucket_out_dir = bucket_dir(out_dir, int(bucket_id))
         bucket_out_dir.mkdir(parents=True, exist_ok=True)
         out_file = bucket_out_dir / "climatology.parquet"
         if out_file.exists() and not overwrite:
             continue
 
-        to_write = bucket_df.drop(columns=["id_bucket"]).sort_values(["ID", "doy"])
-        to_write.to_parquet(out_file, engine="pyarrow", index=False)
+        # Within-bucket (ID, doy) order: cheap per-bucket lexsort on the small slice
+        # (robust even if the source parquet was not globally ID-sorted).
+        sub = np.lexsort((doy[s:e], ids[s:e]))
+        _pq.write_table(
+            pa.table(
+                {
+                    "ID": ids[s:e][sub],
+                    "doy": doy[s:e][sub],
+                    "TD_clim": td_clim[s:e][sub],
+                    "TMIN_clim": tmin_clim[s:e][sub],
+                }
+            ),
+            out_file,
+        )
         shards_written += 1
 
     return BucketedClimatologyResult(

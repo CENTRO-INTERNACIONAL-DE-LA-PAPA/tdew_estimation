@@ -137,7 +137,8 @@ def build_zone_table(
 
     if nearest_fallback and label.isna().any():
         miss = label.isna().to_numpy()
-        nn = gpd.sjoin_nearest(pts.iloc[miss], zones, how="left")
+        # nearest-neighbor distances are only meaningful in a projected CRS (UTM 18S for Peru)
+        nn = gpd.sjoin_nearest(pts.iloc[miss].to_crs(32718), zones.to_crs(32718), how="left")
         nn = nn[~nn.index.duplicated(keep="first")].sort_index()
         label = label.copy()
         label.iloc[miss] = nn["zone_label"].to_numpy()

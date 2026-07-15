@@ -31,6 +31,7 @@ import matplotlib
 
 matplotlib.use("Agg")  # headless / HPC-safe
 import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 log = logging.getLogger("analyze_scaling")
@@ -76,6 +77,35 @@ def compute_metrics(agg: pd.DataFrame) -> pd.DataFrame:
 
 def _slug(*parts) -> str:
     return "_".join(str(p) for p in parts)
+
+
+# ---------------------------------------------------------------------------------------
+# Theoretical reference: the memory-bandwidth-contention model (derived in
+# tdew_estimation_pram.qmd, "Theoretical Efficiency" section). Each unit of work needs
+# compute time t_c and moves q bytes over the memory bus shared by all p cores, so
+#   T_p ≈ W · (t_c / p + q / β)
+# and, with γ = (q/β) / t_c (memory-time : compute-time ratio per unit of work),
+#   S(p) = p(1+γ)/(1+γp),  E(p) = (1+γ)/(1+γp) = O(1/p),  S(∞) = 1 + 1/γ.
+# The problem size N cancels, so a single γ describes every N — which is why the
+# per-N efficiency curves superimpose.
+# ---------------------------------------------------------------------------------------
+def theory_efficiency(p, gamma: float):
+    """E(p) = (1+γ)/(1+γp) for the shared-bandwidth contention model."""
+    return (1.0 + gamma) / (1.0 + gamma * np.asarray(p, dtype=float))
+
+
+def fit_gamma(p, eff) -> float:
+    """Least-squares fit of γ in E(p)=(1+γ)/(1+γp) over pooled (p, efficiency) points."""
+    p = np.asarray(p, dtype=float)
+    eff = np.asarray(eff, dtype=float)
+    grid = np.geomspace(1e-4, 10.0, 400)
+    best = grid[0]
+    for _ in range(3):  # coarse-to-fine 1-D search (keeps us scipy-free)
+        sse = np.array([np.square(eff - theory_efficiency(p, g)).sum() for g in grid])
+        i = int(np.argmin(sse))
+        best = float(grid[i])
+        grid = np.linspace(grid[max(i - 1, 0)], grid[min(i + 1, len(grid) - 1)], 400)
+    return best
 
 
 def write_markdown(metrics: pd.DataFrame, md_out: Path) -> None:
@@ -149,6 +179,11 @@ def make_plots(metrics: pd.DataFrame, out_dir: Path) -> list[Path]:
         fig, ax = plt.subplots(figsize=(5, 4))
         ax.plot(ps, g["efficiency"], marker="o")
         ax.axhline(1.0, linestyle="--", color="gray", label="ideal")
+        if mode == "strong" and len(ps) >= 3:
+            gamma = fit_gamma(ps, g["efficiency"])
+            pg = np.geomspace(ps.min(), ps.max(), 128)
+            ax.plot(pg, theory_efficiency(pg, gamma), "--", color="red",
+                    label=rf"theory $E=(1+\gamma)/(1+\gamma p)$, $\gamma$={gamma:.3f} $\to O(1/p)$")
         ax.set_xlabel("processors p")
         ax.set_ylabel("weak efficiency" if mode == "weak" else "efficiency E(p)")
         ax.set_ylim(0, 1.2)
@@ -199,6 +234,9 @@ def make_family_plots(fam: pd.DataFrame, out_dir: Path) -> list[Path]:
         sizes = sorted(g["B"].unique())
         colors = plt.cm.viridis([i / max(len(sizes) - 1, 1) * 0.7 + 0.15 for i in range(len(sizes))])
         base = _slug(dataset, hw, phase)
+        # One γ fitted over ALL problem sizes at once: the contention model is N-free,
+        # so a single curve should describe the whole family.
+        gamma = fit_gamma(g["p"], g["efficiency"]) if len(g) >= 3 else None
 
         def _label(B):
             nid = int(g[g.B == B]["n_ids"].iloc[0])
@@ -219,6 +257,14 @@ def make_family_plots(fam: pd.DataFrame, out_dir: Path) -> list[Path]:
             for B, c in zip(sizes, colors):
                 s = g[g.B == B].sort_values("p")
                 ax.plot(s["p"], s[col], marker="o", color=c, label=_label(B))
+            if gamma is not None and col in ("speedup", "efficiency"):
+                pg = np.geomspace(1, pmax, 128)
+                if col == "efficiency":
+                    ax.plot(pg, theory_efficiency(pg, gamma), "--", color="red",
+                            label=rf"theory $E=(1+\gamma)/(1+\gamma p)$, $\gamma$={gamma:.3f} $\to O(1/p)$")
+                else:
+                    ax.plot(pg, pg * theory_efficiency(pg, gamma), "--", color="red",
+                            label=rf"theory $S(p)$, $S(\infty)=1+1/\gamma \approx${1 + 1 / gamma:.1f}")
             ax.set_xscale("log", base=2)
             if yscale == "log":
                 ax.set_yscale("log")

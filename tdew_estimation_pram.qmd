@@ -571,8 +571,8 @@ inner level is exploited is exactly what differs between CPU and GPU:
   one at a time: it assembles the `XᵀWX` normal equations for *all* `≈ (N/B)·D ≈ 10⁵`
   fits in the bucket and solves them in a single **batched** call, spreading them
   across thousands of CUDA cores. That inner batch width — on the order of `10⁵` fits
-  offered to the device per wave, cleared in milliseconds — is where the GPU's speed
-  comes from, and **`min(p, B)` does not bound it**. The practical implication reverses
+  offered to the device per batched call, cleared in milliseconds — is where the GPU's
+  speed comes from, and **`min(p, B)` does not bound it**. The practical implication reverses
   the CPU rule: a GPU wants buckets *large enough* that each batch fills the device, so
   one does not push `B` very high for GPU runs.
 
@@ -1096,10 +1096,15 @@ different levels:
   On GPU this is the **batch width**: the device factors `10^5` stacked `5\times5`
   systems at once. `min(p, B)` does **not** bound this level.
 
-Concretely, a single A100 (108 SMs, up to ~2048 resident threads each, so
-`\approx 2.2\times10^5` threads in flight) is offered a whole bucket's `\approx 10^5`
-fits per wave and clears them in milliseconds. So one A100 gives `p = 1` at the bucket
-level but `\sim 10^5` fit-lanes per wave — the speed lives at the inner level. This
+Concretely, on the benchmark device (a MIG `a100_3g.20gb` slice, 42 SMs) the compiled
+solve kernel needs 127 registers per thread, so the register budget — not the nominal
+2048-threads-per-SM limit — is what binds: 512 threads fit per SM, and the device holds
+`42 \times 512 = 21{,}504` fits in flight at once. A whole bucket's `\approx 10^5` fits
+are offered to the device in one batched call and cleared in about 5 hardware **waves**
+of 21,504 fits each, within milliseconds (the "Wave granularity" subsection of the
+Theoretical Efficiency section derives and validates these numbers from the benchmark
+results). So one GPU gives `p = 1` at the bucket level but `\sim 2\times10^4` fit-lanes
+per wave — the speed lives at the inner level. This
 also reverses the bucket-count guidance: CPU wants **many** buckets (`B \geq 4p`) to
 keep cores busy, whereas GPU wants buckets **large enough** that each batch fills the
 device, so `B` is not pushed high for GPU runs.
@@ -1280,3 +1285,200 @@ strong-scaling sweep; (2) a table of `E_{weak}(p)`; and (3) three plots — exec
 **roofline** (achieved GFLOPS vs arithmetic intensity with the compute/bandwidth ceilings);
 and a **CPU-vs-GPU** wall-clock comparison. Together these quantify how the implementation
 scales and which hardware minimizes wall-clock time for this workload.
+
+## Theoretical Efficiency: Reference Curves for the Scaling Plots
+
+The empirical plots above show *measured* efficiency. This section derives the
+*theoretical* efficiency curves that are overlaid (dashed) on those plots, in the same
+spirit as the asymptotic `O`-notation reduction for the parallel K-means exercise:
+start from a time model, form `E(p) = T_1 / (p T_p)`, and reduce with the problem size
+held constant. The two hardware targets need two different derivations, because they
+expose parallelism on two different axes: the CPU sweeps **processors `p`** at fixed
+problem size, while the single GPU sweeps **problem size `M`** at fixed `p = 1`.
+
+### CPU: efficiency model under shared memory bandwidth
+
+**Ruling out the fixed-overhead model first.** The PRAM prediction for the training
+stage is `T_p = O(NDYh/p + \log(Yh))` (with `B \geq 4p`, so `min(p,B) = p`). If the
+departure from ideal efficiency were caused by that fixed additive overhead (call it
+`\sigma`), the efficiency would be
+
+$$
+E(N,p) = \frac{W t_c}{W t_c + p\,\sigma},
+\qquad W = NDYh ,
+$$
+
+which *improves* as `N` grows: a larger problem dilutes a fixed overhead. The
+measurements show the opposite — the `E(p)` curves for `N = 512`, `1024`, and `2048`
+IDs are superimposed almost exactly. So the binding constraint is not a fixed
+overhead; it must be a resource that is *consumed in proportion to the work itself*
+and *shared by all `p` workers*. On one node that resource is the **memory bus**.
+
+**Time model.** Each unit of work (one row touched during a local fit) needs compute
+time `t_c` and moves `q` bytes. Compute divides among the `p` cores; the `Wq` bytes of
+memory traffic must all cross the one shared bus of bandwidth `\beta` no matter how
+many cores are active:
+
+$$
+T_p \;=\; \underbrace{\frac{W t_c}{p}}_{\text{compute, shared out}}
+\;+\; \underbrace{\frac{W q}{\beta}}_{\text{bus, not shared}} .
+$$
+
+**Speedup and efficiency.** With `T_1 = W\,(t_c + q/\beta)` and the single
+dimensionless ratio
+
+$$
+\gamma \;=\; \frac{q/\beta}{t_c}
+\quad\text{(memory time per unit of work} \;/\; \text{compute time per unit of work),}
+$$
+
+the speedup and efficiency are
+
+$$
+S(p) \;=\; \frac{T_1}{T_p} \;=\; \frac{p\,(1+\gamma)}{1+\gamma p},
+\qquad
+E(p) \;=\; \frac{S(p)}{p} \;=\; \frac{1+\gamma}{1+\gamma p} .
+$$
+
+**Asymptotic reduction.** Note something *stronger* than the "`N` constant" premise of
+the K-means exercise: the work `W = NDYh` **cancels entirely** — `E(p)` depends only on
+`\gamma` and `p`, not on the problem size. That is exactly the empirical signature in
+the strong-scaling plot (three problem sizes, one curve). In `O`-notation:
+
+$$
+E(p) \;=\; O\!\left(\frac{1}{1+\gamma p}\right) \;=\; O\!\left(\frac{1}{p}\right)
+\quad (p \gg 1/\gamma),
+$$
+
+and the speedup saturates at
+
+$$
+S(\infty) \;=\; \lim_{p\to\infty} \frac{p\,(1+\gamma)}{1+\gamma p}
+\;=\; 1 + \frac{1}{\gamma} .
+$$
+
+The asymptotic class is the same `O(1/p)` as the broadcast K-means version, but the
+physical cause differs: there it was communication volume growing with `p`; here it is
+`p` cores contending for one memory bus.
+
+**Fitting `\gamma`.** The model has a single parameter, estimated by least squares over
+the pooled measured points of *all three* problem sizes (the model says one `\gamma`
+must fit them all — a falsifiable claim, not a convenience). On the KHIPU Job A data
+this gives `\gamma \approx 0.063`, i.e. memory stalls cost about 6% of the compute time
+per unit of work, and
+
+| `p` | 2 | 4 | 8 | 16 | 32 |
+|---|---:|---:|---:|---:|---:|
+| `E(p)` predicted | 0.944 | 0.849 | 0.707 | 0.529 | 0.352 |
+| `E(p)` measured (N=512/1024/2048) | 0.91–0.94 | 0.82–0.83 | 0.70–0.71 | 0.56 | 0.34–0.35 |
+
+with a saturation ceiling `S(\infty) \approx 17` — consistent with the measured speedup
+still creeping upward at `S(32) \approx 11`. This is the red dashed curve on the
+efficiency plot (drawn by `analyze_scaling.py`: `fit_gamma` / `theory_efficiency`), the
+analogue of the `O(1/p)` reference line in the K-means exercise.
+
+### GPU: what the theoretical curve is when `p = 1`
+
+The GPU plot (`gpu_pipeline_time_vs_M.png`) has **no processor axis**: there is one
+device, and the x-axis is the problem size `M = N \cdot 366` fits. An "ideal
+efficiency `E(p) = 1`" line is therefore meaningless there — with `p_{GPU} = 1`,
+`E(p)` is identically 1 by construction and says nothing. The outer `min(p, B)` level
+of the PRAM model is pinned at 1; all the performance lives in the *inner* batch
+level, and the correct theoretical reference for that level comes from the roofline.
+
+**Bandwidth floor.** The roofline analysis showed every stage sits far below the ridge
+(`I \approx 0.08`–`0.6` FLOP/byte vs ridge `\approx 6.6`), so each stage is
+memory-bandwidth bound and its execution time is bounded below by the time needed just
+to move its bytes:
+
+$$
+T_{bound}(M) \;=\; \frac{Q_s(M)}{\beta},
+$$
+
+where `Q_s(M)` is the analytic bytes-moved model of stage `s` (the `assemble_cost`,
+`convolve_cost`, `solve_cost` functions in `benchmark_gpu_pipeline.py`) and `\beta` is
+the *measured* HBM bandwidth of the slice (633 GB/s). Since `Q_s(M) \propto M`, the
+floor is `T_{bound} = O(M/\beta)`: a straight dashed line of slope 1 in the log-log
+plot, one per stage. This — not an efficiency line — is the theoretical curve drawn on
+`gpu_pipeline_time_vs_M.png`.
+
+**The single-GPU analogue of efficiency.** The quantity that plays the role of `E(p)`
+is the **bandwidth utilization**
+
+$$
+\eta(M) \;=\; \frac{T_{bound}(M)}{T_{meas}(M)}
+\;=\; \frac{\text{achieved GB/s}}{\beta} \;\in\; (0, 1] ,
+$$
+
+the vertical gap between each measured curve and its dashed floor. A simple
+latency-plus-bandwidth time model explains its shape: with a fixed per-launch cost
+`t_0`,
+
+$$
+T(M) \;\approx\; t_0 + \frac{Q(M)}{\beta}
+\qquad\Longrightarrow\qquad
+\eta(M) \;=\; \frac{Q(M)/\beta}{t_0 + Q(M)/\beta} \;\xrightarrow[M \to \infty]{}\; 1 ,
+$$
+
+so `\eta` is low while the batch is too small to hide the launch cost and rises toward
+a plateau once `M` fills the device. The measurements match: `convolve` is flat at
+`\approx 7` ms from `N = 64` to `N = 293` (pure launch overhead, `\eta \approx 0.1`)
+and reaches `\eta \approx 0.5` at `N = 1024`; `assemble` holds `\eta \approx 0.6`
+throughout; the `solve` kernel reaches `\eta \approx 0.9` at the largest `M` —
+essentially at its roofline. In `O`-notation the story is one line: on a single GPU,
+
+$$
+T(M) = O\!\left(t_0 + \frac{M}{\beta}\right),
+\qquad
+\eta(M) = O\!\left(\frac{1}{1 + t_0 \beta / M}\right) \;\to\; 1 ,
+$$
+
+the mirror image of the CPU case — there, efficiency *decays* as `O(1/p)` because
+workers contend for one bus; here, utilization *saturates* toward the bandwidth
+ceiling as the batch grows, which is precisely why the GPU wants **large buckets**
+(the `B` guidance of the HPC section) while the CPU wants many.
+
+### Wave granularity: how many fits run at the same instant
+
+The batched solve does not execute all `M` fits simultaneously; the hardware runs them
+in **waves**, and the benchmark results contain everything needed to count them:
+
+1. The solve kernel uses **one thread per fit**, and the compiled kernel needs
+   **127 registers per thread** — a *register* is a thread's private fast storage
+   (here holding the `5\times5` system and the Cholesky intermediates). This number is
+   chosen by the CUDA compiler, reported by cupy, and logged as the `num_regs` column
+   of `gpu_kernel.csv`.
+2. GPU threads are scheduled in **warps** of 32 threads, so one warp needs
+   `32 \times 127 \approx 4{,}064` registers, which the hardware rounds up to `4{,}096`.
+3. Each SM owns a pool of `65{,}536` registers, so `65{,}536 / 4{,}096 = 16` warps
+   `= 512` threads fit per SM — register-limited to 25% of the nominal
+   2048-thread-per-SM capacity.
+4. The MIG slice has **42 SMs**, so the device holds
+   `42 \times 512 = 21{,}504` fits in flight at any instant, and
+
+$$
+\text{waves}(M) \;=\; \left\lceil \frac{M}{21{,}504} \right\rceil .
+$$
+
+| `M` (fits) | waves | solve time (ms) | µs per wave |
+|---:|---:|---:|---:|
+| 23,424 | 2 | 0.0266 | 13.3 |
+| 107,238 | 5 | 0.0727 | 14.5 |
+| 187,392 | 9 | 0.1065 | 11.8 |
+| 374,784 | 18 | 0.1915 | 10.6 |
+| 800,000 | 38 | 0.3835 | 10.1 |
+
+The last column is the model check: measured solve time divided by the wave count
+settles to a constant `\approx 10` µs per wave as `M` grows (the higher values at small
+`M` are the launch overhead `t_0` of the previous subsection), and 21,504 fits every
+10 µs reproduces the measured saturated throughput of `\approx 2\times10^9` fits/s. At
+full scale, the 300k-ID domain (`M_{total} \approx 1.1\times10^8` fits) therefore ran
+about **5,150 solve waves** in total, `\approx 5` per `B = 1024` bucket.
+
+No dedicated "waves vs `M`" plot is needed: `waves(M)` is the straight line
+`M/21{,}504` by construction, so it carries no information beyond this table. The
+visual evidence of wave execution is already in the time-vs-`M` plot — above one wave
+the solve curve grows linearly in `M`, at a fixed `\approx 10` µs per step of 21,504
+fits. (The wave count applies to the `solve` RawKernel only; `assemble` and `convolve`
+are cupy library operations whose launch shapes were not recorded, and being
+bandwidth-bound their floor is set by `Q(M)/\beta` regardless of wave structure.)

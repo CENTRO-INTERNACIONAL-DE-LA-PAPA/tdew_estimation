@@ -88,13 +88,30 @@ Strong scaling at three problem sizes (512 / 1024 / 2048 IDs), workers `p ∈ {1
 ![Speed-up vs workers](figs/cpu/family_speedup_v12_cpu_train.png){#fig-cpu-speedup}
 :::
 
-![Parallel efficiency vs workers — the three problem-size curves are nearly superimposed.](figs/cpu/family_efficiency_v12_cpu_train.png){#fig-cpu-eff width=70%}
+![Parallel efficiency vs workers — the three problem-size curves are nearly superimposed. The red
+dashed curve is the fitted memory-contention model $E(p)=(1+\gamma)/(1+\gamma p)$ with
+$\gamma \approx 0.063$ — asymptotically $O(1/p)$ and independent of problem size.](figs/cpu/family_efficiency_v12_cpu_train.png){#fig-cpu-eff width=70%}
 
 **Interpretation.** Efficiency stays high to ~4–8 cores, then falls — not because of load imbalance or
 fixed overhead (a bigger problem would dilute those), but because all cores contend for the **same
 memory bus**. The weak-scaling efficiency at 32 cores (≈ 0.35) matches the strong-scaling efficiency
 at 32 cores, which is the signature of a **memory-bandwidth-bound** workload. The practical sweet spot
 is **p ≈ 8** (efficiency ≈ 0.70); 32 cores give the best wall-clock but at ~⅓ efficiency.
+
+**Theoretical reference (dashed red in @fig-cpu-eff).** If each unit of work needs compute time $t_c$
+and moves $q$ bytes across the bus shared by all $p$ cores (bandwidth $\beta$), the training time is
+$T_p = W(t_c/p + q/\beta)$, giving
+
+$$
+E(p) = \frac{1+\gamma}{1+\gamma p}, \qquad \gamma = \frac{q/\beta}{t_c},
+$$
+
+which is $O(1/p)$ for $p \gg 1/\gamma$. Crucially the work $W$ **cancels**: one $\gamma$ must describe
+every problem size — exactly the superimposed curves. A single least-squares fit over all three sizes
+gives $\gamma \approx 0.063$ (predicted $E(8)=0.71$, $E(32)=0.35$ vs measured 0.70–0.71 / 0.34–0.35)
+and a speedup ceiling $S(\infty) = 1+1/\gamma \approx 17$, consistent with the plateau in
+@fig-cpu-speedup. Full derivation in the PRAM complexity document (`tdew_estimation_pram.qmd`,
+"Theoretical Efficiency" section).
 
 ---
 
@@ -139,12 +156,27 @@ moving the sufficient-statistics tensors in `assemble` and `convolve` sets the o
 ![Block-size tuning — 32 threads/block is optimal on this device.](figs/gpu/gpu_block_tuning.png){#fig-gpu-block}
 :::
 
-![Solve-kernel throughput vs problem size (fits/s rises and saturates with M).](figs/gpu/gpu_throughput.png){#fig-gpu-throughput width=70%}
+::: {layout-ncol=2}
+![Per-stage time vs problem size M. Dashed: the theoretical **bandwidth floor**
+$T_{bound}(M)=Q(M)/\beta$ (analytic bytes moved ÷ measured 633 GB/s) — the lower bound for a
+memory-bound stage.](figs/gpu/gpu_pipeline_time_vs_M.png){#fig-gpu-time}
+
+![Solve-kernel throughput vs problem size (fits/s rises and saturates with M).](figs/gpu/gpu_throughput.png){#fig-gpu-throughput}
+:::
 
 **Interpretation.** Every stage (assemble / convolve / solve) sits far below the roofline ridge, so the
 kernel is **bandwidth-bound, not compute-bound** — exactly as expected for these small per-fit linear
 systems. Even so, the raw throughput is enormous: ~2×10⁹ fits/s, and the entire 300 k-point domain
 trains in under 15 minutes.
+
+**Theoretical reference (dashed in @fig-gpu-time).** With a single device there is no processor axis,
+so an ideal-efficiency $E(p)$ line does not apply here; the correct theoretical curve is the roofline
+**bandwidth floor** $T_{bound}(M)=Q(M)/\beta$, a slope-1 dashed line per stage in log-log. The gap to
+the floor — the bandwidth utilization $\eta(M)=T_{bound}/T_{meas}$ — is the single-GPU analogue of
+efficiency: `solve` reaches $\eta \approx 0.9$ at the largest M (essentially at its roofline), while
+`convolve` is launch-overhead dominated at small M (flat ≈ 7 ms, $\eta \approx 0.1$) and climbs as the
+batch fills the device — precisely why the GPU wants **large buckets**. Derivation in
+`tdew_estimation_pram.qmd`, "Theoretical Efficiency" section.
 
 ---
 

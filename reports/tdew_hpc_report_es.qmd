@@ -93,7 +93,9 @@ tiempo de cómputo es lineal en el tamaño del problema — sin anomalías de ca
 ![Aceleración vs trabajadores](figs/cpu/family_speedup_v12_cpu_train.png){#fig-cpu-speedup}
 :::
 
-![Eficiencia paralela vs trabajadores — las tres curvas (por tamaño) casi se superponen.](figs/cpu/family_efficiency_v12_cpu_train.png){#fig-cpu-eff width=70%}
+![Eficiencia paralela vs trabajadores — las tres curvas (por tamaño) casi se superponen. La curva roja
+discontinua es el modelo de contención de memoria ajustado $E(p)=(1+\gamma)/(1+\gamma p)$ con
+$\gamma \approx 0{,}063$ — asintóticamente $O(1/p)$ e independiente del tamaño del problema.](figs/cpu/family_efficiency_v12_cpu_train.png){#fig-cpu-eff width=70%}
 
 **Interpretación.** La eficiencia se mantiene alta hasta ~4–8 núcleos y luego cae — no por desbalance
 de carga ni por sobrecosto fijo (un problema mayor los diluiría), sino porque todos los núcleos compiten
@@ -101,6 +103,22 @@ por el **mismo bus de memoria**. La eficiencia de escalamiento débil con 32 nú
 con la de escalamiento fuerte con 32 núcleos, lo cual es la firma de una carga **limitada por ancho de
 banda de memoria**. El punto óptimo práctico es **p ≈ 8** (eficiencia ≈ 0,70); 32 núcleos dan el mejor
 tiempo de pared pero a ~⅓ de eficiencia.
+
+**Referencia teórica (roja discontinua en @fig-cpu-eff).** Si cada unidad de trabajo requiere un tiempo
+de cómputo $t_c$ y mueve $q$ bytes por el bus compartido entre los $p$ núcleos (ancho de banda $\beta$),
+el tiempo de entrenamiento es $T_p = W(t_c/p + q/\beta)$, lo que da
+
+$$
+E(p) = \frac{1+\gamma}{1+\gamma p}, \qquad \gamma = \frac{q/\beta}{t_c},
+$$
+
+que es $O(1/p)$ para $p \gg 1/\gamma$. Lo crucial es que el trabajo $W$ **se cancela**: un solo
+$\gamma$ debe describir todos los tamaños de problema — exactamente las curvas superpuestas. Un único
+ajuste por mínimos cuadrados sobre los tres tamaños da $\gamma \approx 0{,}063$ (predicho $E(8)=0{,}71$,
+$E(32)=0{,}35$ vs medido 0,70–0,71 / 0,34–0,35) y un techo de aceleración
+$S(\infty) = 1+1/\gamma \approx 17$, consistente con la meseta de @fig-cpu-speedup. La derivación
+completa está en el documento de complejidad PRAM (`tdew_estimation_pram.qmd`, sección
+"Theoretical Efficiency").
 
 ---
 
@@ -147,12 +165,28 @@ es la etapa más eficiente, pero mover los tensores de estadísticos suficientes
 ![Ajuste del tamaño de bloque — 32 hilos/bloque es óptimo en este dispositivo.](figs/gpu/gpu_block_tuning.png){#fig-gpu-block}
 :::
 
-![Rendimiento del kernel de resolución vs tamaño del problema (ajustes/s sube y se satura con M).](figs/gpu/gpu_throughput.png){#fig-gpu-throughput width=70%}
+::: {layout-ncol=2}
+![Tiempo por etapa vs tamaño del problema M. Discontinuas: el **piso de ancho de banda** teórico
+$T_{bound}(M)=Q(M)/\beta$ (bytes movidos analíticos ÷ 633 GB/s medidos) — la cota inferior para una
+etapa limitada por memoria.](figs/gpu/gpu_pipeline_time_vs_M.png){#fig-gpu-time}
+
+![Rendimiento del kernel de resolución vs tamaño del problema (ajustes/s sube y se satura con M).](figs/gpu/gpu_throughput.png){#fig-gpu-throughput}
+:::
 
 **Interpretación.** Todas las etapas (ensamblado / convolución / resolución) están muy por debajo del
 techo del roofline, por lo que el kernel está **limitado por ancho de banda, no por cómputo** —
 exactamente lo esperado para estos pequeños sistemas lineales por ajuste. Aun así, el rendimiento bruto
 es enorme: ~2×10⁹ ajustes/s, y todo el dominio de 300 mil puntos se entrena en menos de 15 minutos.
+
+**Referencia teórica (discontinuas en @fig-gpu-time).** Con un solo dispositivo no hay eje de
+procesadores, así que una línea de eficiencia ideal $E(p)$ no aplica aquí; la curva teórica correcta es
+el **piso de ancho de banda** del roofline, $T_{bound}(M)=Q(M)/\beta$, una recta discontinua de
+pendiente 1 por etapa en log-log. La brecha hasta el piso — la utilización de ancho de banda
+$\eta(M)=T_{bound}/T_{meas}$ — es el análogo de la eficiencia para una sola GPU: `solve` alcanza
+$\eta \approx 0{,}9$ en el M más grande (prácticamente en su roofline), mientras que `convolve` está
+dominado por el costo de lanzamiento en M pequeños (plano en ≈ 7 ms, $\eta \approx 0{,}1$) y sube a
+medida que el lote llena el dispositivo — precisamente por eso la GPU prefiere **buckets grandes**.
+Derivación en `tdew_estimation_pram.qmd`, sección "Theoretical Efficiency".
 
 ---
 

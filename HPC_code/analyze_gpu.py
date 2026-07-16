@@ -34,6 +34,7 @@ import matplotlib
 
 matplotlib.use("Agg")  # headless / HPC-safe
 import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 log = logging.getLogger("analyze_gpu")
@@ -155,22 +156,38 @@ def pipeline_tables(pdf: pd.DataFrame) -> dict:
 
 
 def plot_pipeline_curves(pt: dict, out_dir: Path) -> list[Path]:
-    """time vs M, GFLOPS vs M, and time-per-fit vs M — one curve per stage."""
+    """time vs M, GFLOPS vs M, and time-per-fit vs M — one curve per stage.
+
+    On the time panels a dashed **bandwidth floor** is drawn per stage: every stage is
+    memory-bound (AI far below the roofline ridge), so the theoretical lower bound on its
+    time is T_bound(M) = Q(M)/β — the analytic bytes moved (already in the CSV) divided by
+    the measured HBM bandwidth. The gap between a measured curve and its floor is launch
+    overhead / under-utilisation; it is the single-GPU analogue of parallel efficiency.
+    """
     df = pt["df"]
     if df.empty:
         return []
+    bw = pt["meas_bw_gbs"]
+    has_floor = "bytes" in df and np.isfinite(bw)
     written: list[Path] = []
     specs = [
-        ("time_ms_median", "kernel time (ms, median)", "gpu_pipeline_time_vs_M.png", "GPU pipeline: time vs M", True),
-        ("gflops", "achieved GFLOPS (FP64)", "gpu_pipeline_gflops_vs_M.png", "GPU pipeline: GFLOPS vs M", True),
-        ("t_per_fit_us", "time per fit (µs)", "gpu_pipeline_tperfit_vs_M.png", "GPU pipeline: time/fit vs M", True),
+        ("time_ms_median", "kernel time (ms, median)", "gpu_pipeline_time_vs_M.png", "GPU pipeline: time vs M", True, True),
+        ("gflops", "achieved GFLOPS (FP64)", "gpu_pipeline_gflops_vs_M.png", "GPU pipeline: GFLOPS vs M", True, False),
+        ("t_per_fit_us", "time per fit (µs)", "gpu_pipeline_tperfit_vs_M.png", "GPU pipeline: time/fit vs M", True, True),
     ]
-    for col, ylabel, fname, title, ylog in specs:
+    for col, ylabel, fname, title, ylog, theory in specs:
         fig, ax = plt.subplots(figsize=(5.5, 4))
         for st in _STAGES:
             s = df[df["stage"] == st].sort_values("M_fits")
-            if not s.empty:
-                ax.plot(s["M_fits"], s[col], marker="o", label=st, color=_STAGE_COLOR[st])
+            if s.empty:
+                continue
+            ax.plot(s["M_fits"], s[col], marker="o", label=st, color=_STAGE_COLOR[st])
+            if theory and has_floor:
+                floor_ms = s["bytes"] / (bw * 1e6)  # bytes / (GB/s · 1e9) → s, ×1e3 → ms
+                floor = floor_ms if col == "time_ms_median" else floor_ms * 1000.0 / s["M_fits"]
+                ax.plot(s["M_fits"], floor, "--", color=_STAGE_COLOR[st], alpha=0.55, linewidth=1.2)
+        if theory and has_floor:
+            ax.plot([], [], "--", color="gray", label=rf"BW floor $Q(M)/\beta$ ({bw:.0f} GB/s)")
         ax.set_xlabel("number of fits M (= N·366)")
         ax.set_ylabel(ylabel)
         ax.set_xscale("log")

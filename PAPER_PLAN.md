@@ -153,12 +153,22 @@ stability; not the primary holdout.
 ## 7. Task checklist (work from the first unchecked item)
 
 **Phase A — Validation harness (start here; no full re-run needed)**
-- [ ] A1. Build the **baseline ladder** module (climatology, Td=Tmin, zone OLS) on existing artifacts.
-- [ ] A2. Build the **forward-backtest harness**: train-years vs holdout-years split, **autoregressive**
-       prediction of the holdout block, on a stratified ID sample. (Depends on P6, §6 — build P6 first.)
-- [ ] A3. Build the **effect-size + bootstrap + null-test** reporting module.
-- [ ] A4. Run backtest **variant (a) refit-only** for tuned + all baselines; produce the results table + plots.
-- [ ] A5. Run backtest **variant (b) full re-select** on train-years; compare to (a) → selection-bias estimate.
+- [x] A1. Build the **baseline ladder** module (climatology, Td=Tmin, zone OLS). DONE — in `backtest.py`
+       (train-only climatology, streamed per-zone OLS sufficient stats).
+- [x] A2. Build the **forward-backtest harness**: train-years vs holdout split, **autoregressive** holdout
+       prediction on a sample. DONE — `HPC_code_tunning/backtest.py` (refit coeffs via GPU `train_bucket_zoned`
+       → `forecast_zoned`; bucket-subset sample = nationwide lattice, all 41 zones; train-only clim per split).
+- [x] A3. Build the **effect-size + bootstrap + null-test** reporting module. DONE —
+       `HPC_code_tunning/effect_sizes.py` (ΔRMSE + location-block bootstrap CIs, per-cell win rate, Cohen's d,
+       sign-flip permutation null, plots + lead-time curve).
+- [x] A4. Run backtest **variant (a) refit-only** for tuned + all baselines. DONE 2026-07-16 — 64 buckets
+       (17,041 cells, all zones). Results: `$RES/tuning/backtest/{ll1,ll2,ll4}/` + `reports/results/phase_a_backtest.md`.
+       **Tuned decisively beats climatology / Td=Tmin / zone OLS** (see §12). ✅ clears the gate for B0.
+- [x] A5. Run backtest **variant (b) full re-select** on train-years; compare to (a) → selection-bias estimate.
+       DONE 2026-07-17 — `HPC_code_tunning/select_backtest.py` (train-only frames + train-only clim, no leak;
+       16 buckets, per_zone_n=200). **ll4 skill: (a) 0.2057 → (b) 0.1969; selection bias = 0.0088 skill
+       (~+0.013 °C RMSE, ~4% of uplift) — negligible.** Tuned still wins 99.99% of cells, d 2.86, p≈2e-4.
+       Results: `$RES/tuning/backtest_reselect/`. **Method confirmed robust → B0 justified.**
 
 **Phase B — Production deliverable**
 - [ ] B0. **Re-select + re-train the full grid with the extended h-grid** `{7,11,15,21,31,45}` (§9), replacing
@@ -245,4 +255,38 @@ be mindful of bias; **disclose AI use** in the paper.
   **Key finding for B2:** raw v1.2 Tmin is a 302k-ID grid, product is 2.8M-ID → B2 is a REGRID (see §6);
   regridded full-grid v1.2 Tmin exists only for 1981–2016 at `$FULL/tmin_v12/Outputs`. A2 does NOT depend on
   B2 (backtest Tmin for 2013–2016 is already in the prepared shards). Methodological choice for A2: train-only
-  climatology (1981–2012) to avoid holdout leakage. Next: A1 baselines + A2 backtest harness.
+  climatology (1981–2012) to avoid holdout leakage.
+- 2026-07-16 — **Phase A A1–A4 DONE.** `backtest.py` + `effect_sizes.py`; refit-only autoregressive backtest,
+  64-bucket nationwide sample (17,041 cells, all 41 zones), train-only climatology. Headline effect sizes
+  (paired, location-block bootstrap 95% CI; sign-flip perm null 5000):
+
+  | split (train→predict) | RMSE tuned | RMSE clim | ΔRMSE vs clim [CI] | skill | cells win | Cohen d | p |
+  |---|---|---|---|---|---|---|---|
+  | ll1 (1981–2015→2016) | 1.262 | 1.680 | +0.418 [0.417,0.420] | 0.249 | 100.0% | 4.20 | 2e-4 |
+  | ll2 (1981–2014→2015–16) | 1.274 | 1.667 | +0.392 [0.391,0.394] | 0.235 | 99.98% | 3.08 | 2e-4 |
+  | **ll4 (1981–2012→2013–16)** | **1.219** | **1.535** | **+0.316 [0.314,0.317]** | **0.206** | **99.99%** | **2.98** | **2e-4** |
+
+  Tuned also beats Td=Tmin (ΔRMSE ~+2.3 °C) and zone OLS (~+1.1 °C) at every lead. Skill decays with lead
+  (0.249→0.235→0.206) = expected error growth. bias ≈ −0.05 °C, r ≈ 0.990. **Result is decisive → tuning is
+  worth the full run (B0 gate cleared).** Caveat: variant (a) — recipe *selection* used the 1981–2016 manifest
+  (saw holdout); A5 (re-select on train-years) will bound that residual optimism. Report:
+  `reports/results/phase_a_backtest.md`.
+- 2026-07-17 — **A5 DONE (selection-bias check).** Honest train-only re-select (`select_backtest.py`): ll4
+  tuned skill vs clim (a) 0.2057 → (b) 0.1969 → **selection bias 0.0088 (~+0.013 °C, ~4% of uplift) —
+  negligible.** Tuning improvement over climatology is real & robust. **Phase A fully complete (A1–A5).**
+  NOT run: B0 (full re-select+train with extended h-grid, ~31 h), B2 (regrid 2017–2020 Tmin), B3 (fill) —
+  all await user go-ahead. Note: Phase A used the OLD h-grid {7,11,15,21}; B0 adds {31,45} (untested here).
+- 2026-07-17 — **h-grid sensitivity check (sample, ll4).** Re-select train-only with extended
+  {7,11,15,21,31,45} vs {7,11,15,21}: modal h moves 21 (51%) → 45 (**39%**, i.e. below the >40% "still
+  saturating" line; 31 used 12%). Honest tuned-vs-clim skill: {7,11,15,21}=0.1969 → extended=**0.2001**
+  (+0.003, ~1.6% rel; mean LOYOCV skill 0.780→0.782, uplift-vs-fixed5 0.019→0.022). **Verdict: adopt the
+  extended grid for B0 (small positive, not saturating); h-grid is second-order — the tuning carries the
+  result. Weak case to probe h=61 (diminishing returns + seasonal-specificity loss).** Results:
+  `$RES/tuning/backtest_hgrid_ext/`.
+- 2026-07-17 — **B0 LAUNCHED** (user-approved, extended h-grid). `bash tmp/b0_run.sh` detached (PID 1216017),
+  `--stage select` (per_zone_n=2000, h-grid {7,11,15,21,31,45}) then `--stage train --overwrite` on 1981–2016
+  v1.2 Tmin → replaces the production manifest + `zoned_coeffs/`. Old manifest backed up:
+  `$RES/tuning/manifest_oldhgrid_backup.parquet`. Log: `$RES/tuning/b0_run.log`. ~37 h select + ~6 h train
+  (6 h-values ≈ 1.5× the old 4-value ~25 h). GPU healthy at launch (100% util, 10.3/12.3 GB). Progress:
+  select-done = manifest.parquet mtime updates + log "SELECT done"; train has no per-bucket log (watch coeffs
+  mtimes). **After B0: B2 (regrid 2017–2020 Tmin, see §6) → B3 (full-grid fill) → Phase C.**

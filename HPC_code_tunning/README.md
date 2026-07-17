@@ -18,6 +18,67 @@ This module, GPU-accelerated on the workstation, does three things:
 Both the feature recipe and `h` are selected per `zone × doy` (there is no "season"
 bucketing). Set `--granularity zone` for one recipe + one `h` per zone instead.
 
+The module also carries the two halves that turn recipes into a usable product:
+`forecast_zoned.py` applies the tuned coefficients to produce the Td field (autoregressive),
+and `backtest.py` / `effect_sizes.py` / `select_backtest.py` are the temporal-validation
+harness that decides whether the tuning is worth deploying. Both are wired into the
+step-by-step guide under **Reproducing the model** below.
+
+## Two runs, two year-windows (read this first)
+
+The same machinery — zones → select a recipe → train coefficients → autoregressive forecast — is
+used for **two different jobs**, and they use **different year windows for opposite reasons**.
+This is the single most common point of confusion, so here it is as a picture:
+
+```mermaid
+flowchart TB
+    subgraph avail ["The data we have"]
+        direction LR
+        A["1981-2016<br/>Td AND Tmin both exist<br/>we KNOW the true Td here"]
+        B["2017-2020<br/>Tmin only, NO Td<br/>this is the gap to fill"]
+    end
+
+    subgraph val ["JOB 1 - VALIDATE: is the method good enough?<br/>needs a known answer to grade against"]
+        direction TB
+        V1["select + train on 1981-2012<br/>deliberately HIDE 2013-2016"]
+        V2["predict 2013-2016<br/>(autoregressive)"]
+        V3["score vs the Td we hid<br/>tuned vs climatology / Td=Tmin"]
+        V1 --> V2 --> V3
+    end
+
+    subgraph prod ["JOB 2 - PRODUCE: build the deliverable<br/>no known answer, nothing to grade"]
+        direction TB
+        P1["select + train on ALL 1981-2016<br/>use every labelled year"]
+        P2["predict 2017-2020<br/>(autoregressive)"]
+        P3["the gap-filled Td product"]
+        P1 --> P2 --> P3
+    end
+
+    A -->|"hold out the last 4 yrs, so we can grade"| val
+    val -->|"ONLY if tuned clearly beats climatology"| prod
+    A -->|"all years - strongest model"| P1
+    B -->|"Tmin is the forecast input"| P2
+```
+
+**How to read it — the key idea is where the *predicted* years sit relative to the *training* years:**
+
+- The predicted years must **never** be inside the training window, or the model has seen the
+  answer it's being asked for. Both jobs respect this.
+- **Validate (Job 1)** *invents* a gap to grade against: it hides 2013-2016, trains only on
+  1981-2012, predicts 2013-2016, then checks against the Td it hid. The hold-out is the whole
+  point — that is the **only** reason to stop selection/training at 2012.
+- **Produce (Job 2)** has a *real* gap (2017-2020, which genuinely has no Td). Nothing to grade,
+  so you use **every** labelled year (1981-2016) to build the strongest model. Selecting on
+  1981-2016 here **cannot leak**, because the predicted years (2017-2020) aren't in that window.
+- So the rule is simply: **hold years out only when you need to grade; once the method is graded,
+  retrain on everything.** Job 1 proved the method works on a 1-4-year horizon; Job 2 applies the
+  same 1-4-year forecast to the real gap.
+
+(One subtlety inside Job 1: even the *recipe selection* should stop at 2012, not just the
+coefficient fit — otherwise the recipe peeks at the hold-out. `select_backtest.py` does exactly
+that; comparing it to a shortcut that reused the 1981-2016 recipe is how we measured that this
+peeking barely matters — see Step 2.)
+
 ## Pipeline at a glance
 
 ```mermaid
@@ -81,6 +142,10 @@ needs no `dask-cuda`). The full-grid training pass can fan out over GPUs with
 | `manifest.py` | read/write the `(zone × doy) → (h, feature_set)` recipe manifest + a fast lookup with per-zone fallback. |
 | `train_zoned.py` | single-pass full-grid training applying each grid point's zone feature mask (zero-column trick); tidy/long coeff output. |
 | `run_tuning_hpc.py` | CLI entrypoint wiring zones → selection → zoned training. |
+| `forecast_zoned.py` | applies the tidy/long zoned coeffs to produce the Td field: an autoregressive recursion (predicted Td feeds next-day `TD_anom_lag*`) that handles any per-`(zone×doy)` feature set and TD lags up to 30 d. Single-ID reference core + a vectorised-across-IDs bucket path. |
+| `backtest.py` | temporal forward backtest + baseline ladder (climatology, Td=Tmin, zone OLS) on a bucket-subset sample: train-only climatology, coeffs refit on the train years, autoregressive prediction of held-out years, scored against observed Td. |
+| `effect_sizes.py` | turns backtest errors into ΔRMSE + location-block bootstrap CIs, skill scores, per-cell win rate, Cohen's d, and a sign-flip permutation null; writes the summary plots. |
+| `select_backtest.py` | re-runs recipe selection on **train-years only** (train-only frames + climatology, no holdout leakage) to check the recipe choice itself isn't overfitting the held-out years. |
 
 ## Four tricks that make it tractable
 
@@ -138,9 +203,9 @@ Micro-benchmarked on the workstation: one selection convolution of a
 
 | phase | work | ballpark (1× A2000) |
 |---|---|---|
-| **Selection** | 36 zones × 4 `h` × ~5 backward-stepwise rounds, each a pass over `2000/96 ≈ 21` chunks (convolution + scatter bound) | **~5–10 h** |
-| **Training** | one pass over ~2M IDs = ~8k buckets × (assemble + up to 4 `h` convolutions + solve + shard I/O) | **~1–3 h** |
-| **Total tuning** | selection + training | **~half a day to a day** |
+| **Selection** | 41 zones × `h` values × ~5 backward-stepwise rounds, each a pass over `2000/96 ≈ 21` chunks (convolution + scatter bound) | **~25 h** at 4 `h`; **~37 h** at 6 `h` (`7,11,15,21,31,45`) |
+| **Training** | one pass over ~2.8M IDs = 8192 buckets × (assemble + `h` convolutions + solve + shard I/O) | **~6 h** |
+| **Total tuning** | selection + training | **~1.5–2 days** at the production 6-`h` grid, single A2000 |
 
 Not included: the one-time **prep (P-1)** — ~1 TB extraction + bucketing of the national
 grid — which is itself many hours (see `HPC_code/RUNBOOK.md`).
@@ -155,139 +220,233 @@ zone first to calibrate.
 
 Default (no data re-prep needed): `const, TMIN_anom, TMIN_anom_lag{1,2,7,30},
 TD_anom_lag{1,2,3,7,30}`. `TD_anom` is always the target, so `TD` enters only through
-lags. TMAX/PREC candidates are deferred — they need a shard-builder change (plan P7).
+lags. TMAX/PREC candidates are deferred — they would need a shard-builder change to add those
+variables to the bucketed inputs.
 
-## Runbook
+## Reproducing the model, end to end
 
-Run everything with the project venv (`.venv/bin/python`, has CuPy + a CUDA device).
-`$BASE` is the results root holding the bucketed shards.
+Six steps: **inputs → zones → select recipes → validate → train → forecast**. Each says *why*
+it exists; skip a step only when its output already exists. Everything runs with the project
+venv (`.venv/bin/python`, has CuPy + a CUDA device).
 
-### Step 0 — data prep (PREREQUISITE, once, NOT this module)
-
-This module does **not** download, prep, or bucket data. Produce the shards first with the
-standard prep — see `HPC_code/RUNBOOK.md`. You need, under `$BASE`:
-
-```
-$BASE/bucketed_training_data/id_bucket=*/     # ID, FECHA, TD, TMIN, doy
-$BASE/climatology_by_bucket/id_bucket=*/climatology.parquet   # ID, doy, TD_clim, TMIN_clim
-```
-
-For the full national grid, prep with `download_data.sh PERU_POTATO=0` (~2M points +
-`grid_index.parquet`) then `prep_inputs.py` with predictor `tmin_v12`, target `td`, train
-years `1981 2016`, and a **large `--num-buckets`** (≈8192) so training stays in GPU memory.
-Verify there is ≥ ~1 TB free before starting. **Check first:**
+On a single RTX A2000 (12 GB) train in-process with `--cluster none` — `dask-cuda` is broken in
+this `.venv`; on a multi-GPU box use `--cluster cuda`. Selection and training are multi-hour, so
+run them detached and watch the log:
 
 ```bash
-ls "$BASE"/bucketed_training_data/ | head        # buckets exist?
-ls "$BASE"/climatology_by_bucket/ | head
+setsid nohup <cmd> > run.log 2>&1 < /dev/null &   # survives the terminal; tail -f run.log
 ```
 
-### Step 1 — one-shot full pipeline (zones → select → train)
+**Setup (paste once per shell):**
 
 ```bash
-.venv/bin/python -m HPC_code_tunning.run_tuning_hpc \
-    --base       "$BASE" \
-    --coords     "$BASE"/grid_index.parquet \
-    --zones-zip  ~/Downloads/clasif_clima_peru.zip \
+cd /home/ppalacios/Documents/tdew_estimation
+PY=$PWD/.venv/bin/python
+RAW=/media/ppalacios/Data1/henry_simcast_peru/_raw    # raw PISCO .nc (td, tmin_v12)
+FULL=/media/ppalacios/Data1/henry_simcast_peru_full   # grid root (extracted point parquet)
+RES=$FULL/results_tuning                              # bucketed inputs + all tuning outputs
+ZIP=$HOME/Downloads/clasif_clima_peru.zip             # SENAMHI Thornthwaite zone polygons
+```
+
+### Step 0 — bucketed inputs · *why: every later step reads these; the Tmin→Td map is learned on the 1981–2016 overlap where both exist*
+
+You need, under `$RES`, the target `td` (v1.1) and predictor `tmin_v12` per cell/day plus a
+per-cell daily climatology, sharded by `id_bucket` so each shard fits the GPU:
+
+```
+$RES/bucketed_training_data/id_bucket=*/                       # ID, FECHA, TD, TMIN, doy
+$RES/climatology_by_bucket/id_bucket=*/climatology.parquet     # ID, doy, TD_clim, TMIN_clim
+```
+
+If they already exist, skip to Step 1 (`ls "$RES"/bucketed_training_data/ | head`). To build
+them from the raw grid (~250 GB extract + ~250 GB buckets; need ≥1 TB free): extract every cell
+to point parquet — this also writes `grid_index.parquet`, the ID→lon/lat map zones need — then
+bucket. `--num-buckets 8192` keeps each bucket ~340 cells so its training tensors fit 12 GB.
+
+```bash
+$PY HPC_code/nc_to_point_parquet.py --var td       --nc-dir "$RAW/td"       --base "$FULL" --no-peru-potato --year-range 1981,2016
+$PY HPC_code/nc_to_point_parquet.py --var tmin_v12 --nc-dir "$RAW/tmin_v12" --base "$FULL" --no-peru-potato --year-range 1981,2016
+$PY HPC_code/prep_inputs.py --base "$FULL" --results "$RES" \
+    --td-var td --tmin-var tmin_v12 --train-start 1981 --train-end 2016 \
+    --no-future --num-buckets 8192 --n-workers "$(nproc)"
+```
+
+### Step 1 — map each cell to a climate zone · *why: Peru's microclimates differ enough that one global model underfits; each SENAMHI climate zone gets its own recipe*
+
+Point-in-polygon of `grid_index.parquet` against the SENAMHI Thornthwaite polygons (with a
+nearest-polygon fallback so every cell is assigned), cached to `$RES/zone_table.parquet`. Build it
+once now — **both** the validation (Step 2) and the production selection (Step 3) read this file:
+
+```bash
+$PY - <<PY
+from HPC_code_tunning import zones
+zones.build_zone_table("$FULL/td/Outputs/grid_index.parquet", "$ZIP", "$RES/zone_table.parquet")
+PY
+```
+
+(The production `run_tuning_hpc` also builds it automatically if missing, but the validation tools
+in Step 2 expect it to already exist.)
+
+### Step 2 — validate the method first (the go/no-go) · *why: selection skill is optimistic; before spending ~40 h building the production model, prove the tuned model beats the cheap incumbents on years it never saw*
+
+This is **Job 1** in the diagram above and it is **self-contained** — it does its own select+train
+on a short window, so it needs nothing from Steps 3–4 and must come first. It runs an
+**autoregressive forward backtest**: select recipes and fit coefficients on the *early* years only,
+predict the *hidden* recent years with no observed Td in the block (each predicted Td feeds the
+next day's lag — exactly the real gap-fill situation), and score against the Td you withheld. The
+tuned model is compared, on the identical holdout, to the incumbents anyone would otherwise reach
+for: **climatology** (today's gap-filler), **Td = Tmin**, and a per-zone **`Td~Tmin`** line.
+Climatology is recomputed on the train years only, so nothing leaks.
+
+It runs on a handful of whole buckets — because `id_bucket = ID % 8192` scatters neighbouring
+cells, each bucket is a nationwide lattice touching every zone, so a few buckets are a cheap,
+representative, all-zone sample.
+
+To be fully honest the **recipe** must also be selected on the train years only (not just the
+coefficients), or it peeks at the hold-out. So: re-select on 1981–2012, then backtest 2013–2016
+with that train-only recipe.
+
+```bash
+# 1) select recipes on the TRAIN years only (1981-2012), on a small sample
+$PY -m HPC_code_tunning.select_backtest --base "$RES" --split ll4 \
+    --n-buckets 16 --per-zone-n 200 --h-grid 7,11,15,21,31,45 \
+    --out-root "$RES/tuning/backtest"
+# 2) predict the hidden years (2013-2016) with that recipe + the baseline ladder
+$PY -m HPC_code_tunning.backtest --base "$RES" --splits ll4 --n-buckets 64 \
+    --manifest "$RES/tuning/backtest/manifest_trainonly_ll4.parquet" \
+    --out-root "$RES/tuning/backtest"
+# 3) errors -> effect sizes: ΔRMSE + bootstrap CIs, per-cell win rate, Cohen's d, permutation null, plots
+$PY -m HPC_code_tunning.effect_sizes --backtest-root "$RES/tuning/backtest" --splits ll4
+```
+
+**Proceed to Step 3 only if the tuned model clearly beats climatology out-of-sample** (positive
+skill, wins the large majority of cells). If it merely ties climatology, the tuning isn't worth
+deploying — stop here.
+
+*Optional extras (same tools):* run `select_backtest`/`backtest`/`effect_sizes` for `--split ll1`
+and `ll2` as well to get the **lead-time curve** (error growth at 1-, 2-, 4-year horizons); and
+compare the train-only recipe above against one selected on *all* years to measure how much the
+recipe "peeking" inflates the score (it should be small). The numbers this produced for the PISCO
+grid are in `reports/results/phase_a_backtest.md`.
+
+### Step 3 — select the production recipe · *why: the method is validated; now choose the recipe on ALL labelled years for the deliverable*
+
+Exactly the same search as Step 2's selection, but on the **full 1981–2016 window** (Job 2) and the
+full `per_zone_n=2000` sample. Using every labelled year here is both safe and strongest: production
+predicts 2017–2020, which is outside 1981–2016, so the recipe can't peek at what it will forecast
+(see *Two runs, two year-windows* above).
+
+Why the window set `7,11,15,21,31,45`: with only `7,11,15,21`, selection piles up at the largest
+value — it wants more seasonal pooling than the grid offers — so `31,45` give it room. Wider
+windows trade seasonal specificity for sample size; if selection still favours the maximum, that
+saturation is itself a finding.
+
+```bash
+$PY -m HPC_code_tunning.run_tuning_hpc --base "$RES" \
+    --coords "$FULL/td/Outputs/grid_index.parquet" --zones-zip "$ZIP" \
     --tmin-var tmin_v12 --train-years "1981 2016" \
-    --per-zone-n 2000 --id-chunk 256 --h-grid 7,11,15,21 \
-    --granularity doy --stage all --cluster cuda
+    --per-zone-n 2000 --id-chunk 96 --h-grid 7,11,15,21,31,45 \
+    --granularity doy --stage select
 ```
 
-This builds/caches `$BASE/zone_table.parquet`, writes `$BASE/tuning/manifest.parquet`, then
-trains the full grid into `$BASE/tuning/zoned_coeffs/`.
-
-### Step 1 (alt) — run the stages separately
-
-Useful because **selection is minutes** (a per-zone sample) while **training is multi-hour**
-(the whole ~2M grid). The manifest persists between them.
+Writes `$RES/tuning/manifest.parquet` (one row per `zone×doy`: chosen `h`, feature list, LOYOCV
+skill, and its uplift over the fixed-5 baseline). Quick look — the contemporaneous `TMIN_anom`
+should be kept almost everywhere; if it isn't, the anomalies or the sample are wrong:
 
 ```bash
-# 1a. tune recipes only  (single GPU, in-process)
-.venv/bin/python -m HPC_code_tunning.run_tuning_hpc --base "$BASE" \
-    --coords "$BASE"/grid_index.parquet --zones-zip ~/Downloads/clasif_clima_peru.zip \
+$PY - <<PY
+import pandas as pd
+m = pd.read_parquet("$RES/tuning/manifest.parquet")
+print("recipes:", len(m), "zones:", m.zone_id.nunique())
+print(m.h.value_counts().sort_index())                    # which windows win
+print("median uplift vs fixed-5:", round(m.skill_uplift.median(), 4))
+PY
+```
+
+### Step 4 — train the full grid · *why: the recipe was chosen on a sample; now fit the deployable coefficients for every cell*
+
+One bucket-parallel pass over all ~2.8 M cells, each `(ID, doy)` using its zone's recipe as a
+feature mask. `--overwrite` regenerates coeffs if an earlier run left some behind:
+
+```bash
+$PY -m HPC_code_tunning.run_tuning_hpc --base "$RES" \
     --tmin-var tmin_v12 --train-years "1981 2016" \
-    --per-zone-n 2000 --id-chunk 256 --h-grid 7,11,15,21 --stage select
-
-# 1b. train the grid from that manifest  (fan out over GPUs)
-.venv/bin/python -m HPC_code_tunning.run_tuning_hpc --base "$BASE" \
-    --tmin-var tmin_v12 --train-years "1981 2016" --stage train --cluster cuda --overwrite
+    --stage train --cluster none --overwrite
 ```
 
-`--stage train` re-reads the cached `zone_table.parquet` + `manifest.parquet`, so `--coords`
-/`--zones-zip` are not needed the second time.
+`--stage train` reuses the cached zone table + manifest, so `--coords`/`--zones-zip` aren't needed
+again. Output: `$RES/tuning/zoned_coeffs/id_bucket=*/coeffs.parquet` (tidy/long). Watch progress
+with `find "$RES"/tuning/zoned_coeffs -name coeffs.parquet | wc -l` (of 8192). Steps 3+4 can be
+combined with `--stage all`.
 
-### Step 2 — inspect the outputs
+Sanity-check the coeffs:
 
 ```bash
-BASE="$BASE" .venv/bin/python - <<'PY'
-import os, glob, pandas as pd
-from collections import Counter
-base = os.environ["BASE"]
-m = pd.read_parquet(f"{base}/tuning/manifest.parquet")
-print("recipes:", len(m), "| zones:", m.zone_id.nunique())
-print(m.h.value_counts().sort_index())                 # which h won
-c = Counter()
-m.feature_list.str.split(",").apply(c.update)
-print("feature retention:", dict(c.most_common()))     # TMIN_anom should dominate
+$PY - <<PY
+import glob, pandas as pd
 tidy = pd.concat(map(pd.read_parquet,
-                     glob.glob(f"{base}/tuning/zoned_coeffs/id_bucket=*/coeffs.parquet")))
+                     glob.glob("$RES/tuning/zoned_coeffs/id_bucket=*/coeffs.parquet")))
 print("tidy coeff rows:", len(tidy), "| IDs:", tidy.ID.nunique())
 PY
 ```
 
-Sanity check: the contemporaneous `TMIN_anom` should be retained almost everywhere; if it is
-not, something is wrong with the anomalies or the sample.
+### Step 5 — forecast the gap · *why: the deliverable — a Td field for the years that have Tmin but no Td*
 
-### Dev / smoke run
+`forecast_zoned.py` applies the coeffs day by day, feeding each predicted Td into the next day's
+`TD_anom_lag*` inputs (the autoregression), while `TMIN_anom*` inputs come from the observed
+future Tmin. Drive it with `run_bucketed_zoned_forecast(...)`.
 
-No cluster and no real zones needed — point `--coords` at a small `grid_index.parquet` (or a
-point `.shp`), lower `--per-zone-n`, and use `--cluster none`. The test-suite fixtures build
-a fully synthetic bucketed dataset if you just want to exercise the code:
+**Gotcha:** the future Tmin must be on the **same full grid** as the coeffs. The raw v1.2 Tmin
+files are a coarser 302k-cell grid whose IDs point at *different* cells — feeding them directly
+produces garbage (a large spurious Td jump at the seam). Regrid the future Tmin onto the full grid
+first (the Step-0 extraction, for the target years). See `PAPER_PLAN.md §6`.
+
+### Development & smoke test
+
+To exercise the code without real data: the test-suite fixtures build a fully synthetic bucketed
+dataset. For an ad-hoc run, point `--coords` at a small `grid_index.parquet` (or a point `.shp`),
+lower `--per-zone-n`, and use `--cluster none`.
 
 ```bash
 .venv/bin/python -m pytest HPC_code_tunning/tests -q
 ```
 
-### Inputs & defaults
+### Knobs
 
-Inputs are the bucketed shards from Step 0. Predictor defaults to `tmin_v12`, target to the
-shared `td` product (overlap 1981–2016), mirroring Job C. Key knobs: `--per-zone-n` (sample
-per zone), `--id-chunk` (GPU memory), `--h-grid`, `--candidates`, `--granularity {doy,zone}`,
-`--tol`, `--cluster {none,cuda}`, `--stage {select,train,all}`.
+`--per-zone-n` (selection sample per zone), `--id-chunk` (GPU memory ceiling), `--h-grid`,
+`--candidates`, `--granularity {doy,zone}`, `--tol` (stepwise stop threshold),
+`--cluster {none,cuda}`, `--stage {select,train,all}`, `--overwrite`. Predictor defaults to
+`tmin_v12`, target to `td`, overlap `1981 2016`.
 
 ## Outputs
 
 * `manifest.parquet` — `[zone_id, zone_label, doy, h, feature_list, n_features, skill,
   skill_baseline, skill_uplift]` (one row per `zone × doy`, or per zone with `doy = -1` when
-  `--granularity zone`). `skill_baseline` is the production fixed-5/`h=11` model scored by the
-  same LOYOCV cosine, and `skill_uplift = skill − skill_baseline` — the direct
-  tuned-vs-baseline gain that gates whether the full training + forecast (P6) are worth it.
+  `--granularity zone`). `skill_baseline` is the fixed-5/`h=11` model scored by the same LOYOCV
+  cosine; `skill_uplift = skill − skill_baseline` is the in-sample tuned-vs-baseline gain (a first
+  look only — the honest test is Step 2).
 * `zoned_coeffs/id_bucket=*/coeffs.parquet` — **tidy/long** coefficients
-  `[ID, zone_id, doy, feature_name, coeff, r_squared_anom, h]`.
+  `[ID, zone_id, doy, feature_name, coeff, r_squared_anom, h]`, consumed by `forecast_zoned.py`.
 
-## Deploy gap (plan P6 — not yet implemented)
+## Forecast internals & a speed-up worth knowing
 
-`tdew_estimation/forecast.py` hard-codes the 5 canonical coefficient columns, so it cannot
-yet consume the tidy per-`(ID, doy)` recipes to produce the TD field. Generalising it to
-an arbitrary per-`(ID, doy)` feature set + manifest is required before the tuned
-coefficients can be used for prediction.
+`forecast_zoned.py` consumes the tidy per-`(ID, doy)` coeffs directly — no manifest needed at
+forecast time, since the coeffs already encode each cell's retained features. It has a
+transparent single-ID reference recursion and a vectorised-across-IDs bucket path; the two agree
+to `<1e-9` and are pinned in `tests/test_forecast_zoned.py`.
 
-**Parallelism opportunity.** The forecast is autoregressive **only because of the
-`TD_anom_lag*` features**: a predicted TD feeds the next day's lag, forcing a sequential
-recursion along time within each ID. `TMIN_anom*` features are lags of the *exogenous*
-(observed) TMIN input, so they never create that dependency. Consequently:
+The recursion is sequential in time **only because of the `TD_anom_lag*` features**: a predicted
+Td feeds the next day's lag. `TMIN_anom*` features are lags of the *observed exogenous* Tmin, so
+they never create that dependency. Therefore:
 
-* A `(zone, doy)` recipe whose features are **all TMIN-based (no `TD_anom_lag*`)** is a pure
-  feed-forward `X·β` — those days can be predicted fully in parallel (vectorised across all
-  IDs *and* all days), like applying a plain regression.
-* If *any* day in an ID's series uses a `TD_anom_lag`, that ID's timeline keeps a sequential
-  chain (parallelism stays only across IDs, which is what the current bucketed/dask forecast
-  already exploits).
+* A `(zone, doy)` recipe with **no `TD_anom_lag*`** is a pure feed-forward `X·β` — those days can
+  be predicted fully in parallel (across all IDs *and* all days), like a plain regression.
+* If any day uses a `TD_anom_lag`, that ID's timeline stays a sequential chain (parallelism only
+  across IDs).
 
-So the tuner can *enable* a faster forecast: in zones where selection drops the TD lags, the
-generalised `forecast.py` (P6) can take the parallel path; only TD-lag zones need the
-sequential recursion. Worth having P6 branch on "does this recipe contain a `TD_anom_lag`?".
+The current code always runs the day-loop (vectorised across IDs, fast enough for the sampled
+backtest). Branching on "does this recipe contain a `TD_anom_lag`?" is the obvious speed-up for
+the full-grid fill.
 
 ## Tests
 
@@ -303,108 +462,6 @@ GPU tests skip automatically when no CUDA device is present. Run with the projec
 * `test_selection_smoke.py` — planted signal kept, noise decoy dropped.
 * `test_zone_mask_solve.py` — zero-column masked solve == reduced sub-block solve.
 * `test_train_zoned_e2e.py` — manifest → single zoned pass → tidy coeffs, values pinned.
+* `test_forecast_zoned.py` — (CPU, no GPU) vectorised == single-ID reference recursion;
+  independent hand-recursion; autoregressive-feed (predicted TD drives next-day lag).
 
-## Appendix — full national-grid run (workstation, step by step)
-
-The on-disk PISCO data at `/media/ppalacios/Data1/henry_simcast_peru` is the **potato subset
-(302k IDs)**. The full ~2M-point national grid is re-extracted from the raw `.nc` in that
-base's `_raw/` (no re-download) into a **separate** base so the potato data is untouched.
-Data1 has the room (~2.3 TB free); the full extraction is ~250 GB + ~250 GB bucketed.
-
-> Single RTX A2000 → train with `--cluster none` (in-process). **Do not use `--cluster cuda`**
-> — `dask-cuda` is broken in this `.venv`. Run each heavy phase in the background and watch
-> its log with `tail -f`.
-
-### Setup (paste once per shell)
-
-```bash
-cd /home/ppalacios/Documents/tdew_estimation
-PY=$PWD/.venv/bin/python
-RAW=/media/ppalacios/Data1/henry_simcast_peru/_raw      # existing raw .nc (td, tmin_v12)
-FULL=/media/ppalacios/Data1/henry_simcast_peru_full     # NEW base (won't touch the potato data)
-RES=$FULL/results_tuning                                # bucketed inputs land here
-ZIP=$HOME/Downloads/clasif_clima_peru.zip               # SENAMHI zones
-mkdir -p "$FULL"
-```
-
-### Phase 1 — extract the full grid (~250 GB, multi-hour)
-
-`--no-peru-potato` keeps every PISCO cell and writes `grid_index.parquet` (needed for zones).
-
-```bash
-nohup $PY HPC_code/nc_to_point_parquet.py --var td \
-    --nc-dir "$RAW/td" --base "$FULL" --no-peru-potato --year-range 1981,2016 \
-    > "$FULL/extract_td.log" 2>&1 &
-nohup $PY HPC_code/nc_to_point_parquet.py --var tmin_v12 \
-    --nc-dir "$RAW/tmin_v12" --base "$FULL" --no-peru-potato --year-range 1981,2016 \
-    > "$FULL/extract_tmin.log" 2>&1 &
-wait
-
-# verify (~2M cells + a grid_index):
-$PY - <<PY
-import pandas as pd
-gi = pd.read_parquet("$FULL/td/Outputs/grid_index.parquet")
-print("grid cells:", len(gi), "| cols:", list(gi.columns))
-PY
-```
-
-### Phase 2 — bucket the inputs (multi-hour)
-
-```bash
-nohup $PY HPC_code/prep_inputs.py \
-    --base "$FULL" --results "$RES" \
-    --td-var td --tmin-var tmin_v12 \
-    --train-start 1981 --train-end 2016 --no-future \
-    --num-buckets 8192 --n-workers 16 \
-    > "$FULL/prep.log" 2>&1 &
-wait
-
-ls "$RES"/bucketed_training_data/ | head
-ls "$RES"/climatology_by_bucket/ | head
-```
-
-`--n-workers` = CPU cores (use `$(nproc)` minus a few); `--num-buckets 8192` keeps each
-bucket ~244 IDs so training fits the 12 GB GPU.
-
-### Phase 3 — selection first (the go/no-go, ~hours, single GPU)
-
-```bash
-nohup $PY -m HPC_code_tunning.run_tuning_hpc \
-    --base "$RES" \
-    --coords "$FULL/td/Outputs/grid_index.parquet" \
-    --zones-zip "$ZIP" \
-    --tmin-var tmin_v12 --train-years "1981 2016" \
-    --per-zone-n 2000 --id-chunk 96 --h-grid 7,11,15,21 \
-    --granularity doy --stage select \
-    > "$FULL/select.log" 2>&1 &
-wait
-
-# read the uplift — this is the decision point:
-$PY - <<PY
-import pandas as pd
-m = pd.read_parquet("$RES/tuning/manifest.parquet")
-print("recipes:", len(m), "| zones:", m.zone_id.nunique())
-print("median tuned    :", round(m.skill.median(), 4))
-print("median baseline :", round(m.skill_baseline.median(), 4))
-print("median UPLIFT   :", round(m.skill_uplift.median(), 4))
-print("share zone×doy uplift>0.01:", round((m.skill_uplift > 0.01).mean(), 3))
-PY
-```
-
-If the uplift is meaningful → Phase 4. If it's ~0 → tuning doesn't help; skip the full
-training and the P6 forecast work.
-
-### Phase 4 — full-grid training (only if the uplift justifies it; multi-hour)
-
-```bash
-nohup $PY -m HPC_code_tunning.run_tuning_hpc \
-    --base "$RES" \
-    --tmin-var tmin_v12 --train-years "1981 2016" \
-    --stage train --cluster none --overwrite \
-    > "$FULL/train.log" 2>&1 &
-wait
-```
-
-Outputs: `$RES/tuning/zoned_coeffs/id_bucket=*/coeffs.parquet` (tidy). Turning those into an
-actual TD field still needs P6 (`forecast.py` generalization) — again, only worth it if
-Phase 3's uplift is real.

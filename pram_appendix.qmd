@@ -248,9 +248,8 @@ diarios colapsan en una sola curva estacional por ubicación.
 
 ## Algoritmo 3: construir el dataset de entrenamiento bucket-año
 
-Este es el rediseño principal. La costosa fusión mensual de TD/TMIN se paga una sola
-vez. Las filas se distribuyen luego a buckets de ID deterministas y se compactan por
-año.
+La fusión mensual de TD/TMIN se realiza una sola vez. Las filas se distribuyen luego a
+buckets de ID deterministas y se compactan por año.
 
 ```text
 Algorithm BUILD-BUCKET-YEAR-DATASET
@@ -814,51 +813,6 @@ $$
 S_{forecast-bucket} = O\left(\frac{NH}{B} + \frac{ND}{B}\right)
 $$
 
-## Diseño antiguo vs diseño bucket-año
-
-El diseño original al estilo Colab entrenaba una tarea por `ID`. Cada tarea descubría,
-abría y filtraba los mismos archivos parquet mensuales.
-
-Sea `S = 12Y` el número de archivos fuente mensuales por variable.
-
-Sobrecosto de E/S por tarea del diseño antiguo:
-
-$$
-O(NS)
-$$
-
-Para `N = 300 000` y `Y = 40`, esto significa aproximadamente:
-
-$$
-300\,000 \times 480 = 144\,000\,000
-$$
-
-intentos de acceso a archivos por familia de variables antes de considerar las lecturas
-reales de filas.
-
-El diseño bucket-año cambia el patrón de E/S:
-
-- Los archivos fuente se escanean una vez durante el preprocesamiento.
-- El entrenamiento lee archivos compactos bucket-año.
-- Los trabajadores escriben salidas de buckets disjuntas.
-- No se requiere una gran concatenación del lado del driver.
-
-Sobrecosto de escaneo de fuentes nuevo:
-
-$$
-O(S)
-$$
-
-Trabajo de entrenamiento del modelo nuevo:
-
-$$
-O(NDYh)
-$$
-
-Así que el rediseño no elimina el trabajo estadístico de ajustar muchas regresiones
-locales, pero sí elimina el escaneo repetido de archivos fuente que hacía lenta y frágil
-la implementación anterior.
-
 ## Tabla resumen de complejidad
 
 La tabla recopila los tres costos para cada fase. Cada fila se lee así: *"así de grande es
@@ -985,14 +939,14 @@ El término `+ H` permanece porque el pronóstico es recursivo en el tiempo para
 Si no se ejecuta el pronóstico, eliminar `NH/min(p,B) + H`. Si no existen DOYs fallidos,
 eliminar el término `NQYh / min(p,B)`.
 
-Para este proyecto, el cuello de botella práctico tras el rediseño bucket-año es:
+Para este proyecto, el cuello de botella práctico es:
 
 $$
 O(NDYh)
 $$
 
 Ese es el costo de ajustar regresiones locales para muchos IDs y todos los días del año.
-El rediseño reduce principalmente la E/S repetida del antiguo enfoque al estilo Colab.
+La organización bucket-año mantiene acotada la E/S sin modificar este trabajo estadístico.
 
 ## Interpretación HPC
 
@@ -1126,8 +1080,7 @@ abajo, no por el modelo de complejidad.
 
 Las aceleraciones restantes, independientes del hardware, siguen viniendo de:
 
-- evitar escaneos repetidos de parquet (el rediseño bucket-año),
-- usar archivos bucket-año,
+- usar archivos compactos bucket-año,
 - mantener acotada la memoria del trabajador,
 - paralelizar por bucket,
 - y reparar solo los DOYs fallidos en lugar de repetir todo el entrenamiento.

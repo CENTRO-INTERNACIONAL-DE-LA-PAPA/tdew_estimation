@@ -19,8 +19,9 @@ abstract: |
   versiones v1.1 y v1.2, lo que implica ajustar un modelo para del orden de 300 000
   ubicaciones espaciales a lo largo de cerca de 40 años de registro diario. Proponemos un
   modelo de regresión lineal local ponderada sobre anomalías, analizado en el modelo PRAM
-  (variante CREW) e implementado con un rediseño *bucket-año* que reduce drásticamente el
-  sobrecosto de entrada/salida (E/S). Finalmente, se ejecutó un protocolo experimental de
+  (variante CREW) e implementado mediante una organización *bucket-año* que agrupa las
+  entradas en archivos compactos y reduce el sobrecosto de entrada/salida (E/S). Finalmente,
+  se ejecutó un protocolo experimental de
   escalamiento fuerte y débil que midió tiempo de ejecución, aceleración y eficiencia en CPU
   (barrido de 1 a 32 procesos) y, en GPU, sobre una única partición A100 MIG (`a100_3g.20gb`)
   caracterizada por su rendimiento y su *roofline*, de forma idéntica sobre PISCOt v1.1 y v1.2.
@@ -137,8 +138,8 @@ complejidad como los experimentos de escalamiento descritos en la metodología.
 ## Contribución y estructura
 
 El trabajo propone (i) un modelo de regresión lineal local ponderada sobre anomalías para
-estimar TD a partir de TMIN; (ii) un rediseño **bucket-año** del flujo de datos que elimina
-el reescaneo repetido de archivos fuente del enfoque anterior; (iii) un análisis de
+estimar TD a partir de TMIN; (ii) una organización **bucket-año** del flujo de datos que
+agrupa las entradas en archivos compactos; (iii) un análisis de
 complejidad en el modelo PRAM que predice el rendimiento en clústeres de cómputo de alto
 desempeño (HPC); y (iv) un protocolo experimental que mide el escalamiento fuerte y débil en
 CPU y GPU sobre las dos versiones de PISCOt. La Sección de Metodología detalla los datos, el
@@ -219,7 +220,7 @@ conteos) combinan $m$ valores en aproximadamente $\log m$ pasos mediante un árb
 por pares. La anotación `pardo` marca los bucles cuyas iteraciones son independientes y, por
 tanto, paralelizables.
 
-Cada algoritmo se describe con tres costos [@jaja1992introduction]: el **trabajo** $W$
+Cada algoritmo se describe con tres costos [@jaja1992introduction; @cormen2009introduction]: el **trabajo** $W$
 (número total de operaciones, independiente del número de procesadores), el **tiempo
 paralelo** $T_p$ con $p$ procesadores, y el **span** $T_\infty$ (camino crítico, el tiempo
 con procesadores ilimitados). La forma recurrente del tiempo paralelo es
@@ -339,6 +340,20 @@ práctico combina las fases limitadas por entrada/salida (E/S, es decir, lectura
 de archivos en disco; que escalan con $/p$) y las etapas de cómputo bucket-paralelas (que
 escalan con $/\min(p, B)$). La @tbl-complejidad recopila los costos por fase.
 
+La expresión final de tiempo paralelo del pipeline es la siguiente; su derivación término a
+término se presenta en el Apéndice A, subsección «Complejidad global»:
+
+$$
+T_p(N) = O\left(
+\frac{NYD\log(ND/B)}{p}
++ \frac{NDYh}{\min(p,B)}
++ \frac{NQYh}{\min(p,B)}
++ \frac{NH}{\min(p,B)}
++ H
++ \log(NYD)
+\right).
+$$ {#eq-tp-global}
+
 | Fase | Trabajo secuencial $W$ | Tiempo paralelo $T_p$ |
 |:-----|:----------------------:|:---------------------:|
 | Construir climatología | $O(R)$ | $O(R/p + \log R)$ |
@@ -350,14 +365,16 @@ escalan con $/\min(p, B)$). La @tbl-complejidad recopila los costos por fase.
 
 : Trabajo y tiempo paralelo por fase del pipeline. {#tbl-complejidad}
 
-El cuello de botella práctico tras el rediseño es $O(NDYh)$; el aporte del bucket-año es,
-sobre todo, eliminar la E/S repetida del enfoque anterior, no reducir el trabajo estadístico.
+El cuello de botella práctico es $O(NDYh)$; la organización bucket-año reduce la E/S asociada
+al acceso a los datos, pero no modifica el trabajo estadístico de las regresiones locales.
 
 ## Implementación y ejecución de los experimentos
 
 La implementación se apoya en **Dask** para la planificación de tareas y la paralelización,
 en CPU (mediante `dask_jobqueue.SLURMCluster`) y, en GPU, ejecutándose en proceso sobre una
-única partición A100 MIG (sin `dask-cuda`) [@rocklin2015dask]. Conviene distinguir dos niveles de paralelismo. El **nivel externo**
+única partición A100 MIG (sin `dask-cuda`) [@rocklin2015dask]. El código fuente y los
+materiales de reproducibilidad están disponibles en el repositorio institucional del proyecto
+[@cip2026tdewEstimation]. Conviene distinguir dos niveles de paralelismo. El **nivel externo**
 (bucket) es el número de buckets que corren a la vez, acotado por $\min(p, B)$: en CPU, $p$
 es el número de procesos trabajadores de un hilo (≈ núcleos); en GPU fue un solo
 dispositivo (la partición A100 MIG disponible). El **nivel interno** (ajuste) es cuántos de los
@@ -411,7 +428,8 @@ por bloque, un detalle de lanzamiento que se afina por separado.
 ### Cantidades medidas
 
 Para un tamaño de problema fijo, con $T(p)$ el tiempo de reloj usando $p$ procesadores, se
-reportan tres cantidades estándar de rendimiento paralelo:
+reportan tres cantidades estándar de rendimiento paralelo
+[@jaja1992introduction; @kumar1994analyzing]:
 
 $$
 \text{Tiempo: } T(p), \qquad
@@ -419,25 +437,40 @@ $$
 \text{Eficiencia: } E(p) = \frac{S(p)}{p}.
 $$
 
-La aceleración ideal es $S(p) = p$ y la eficiencia ideal $E(p) = 1$. El análisis PRAM predice
-la desviación: como las etapas de entrenamiento son bucket-paralelas con $p_{\text{eff}} \le
-B$, la eficiencia se mantiene alta mientras $p \le B$ y luego se degrada.
+La aceleración ideal es $S(p) = p$ y la eficiencia ideal $E(p) = 1$. En la práctica, la
+fracción secuencial y los sobrecostos limitan la aceleración al aumentar $p$, principio
+formalizado para problemas de tamaño fijo por la ley de Amdahl [@amdahl1967validity]. En este
+pipeline, además, las etapas de entrenamiento son bucket-paralelas con
+$p_{\text{eff}}=\min(p,B)$; por tanto, aun en el modelo ideal, añadir trabajadores después de
+$p=B$ no reduce el término dominante. El análisis de escalabilidad debe considerar a la vez
+el crecimiento del problema, el número de procesadores y el sobrecosto paralelo
+[@kumar1994analyzing].
 
 ### Escalamiento fuerte y débil
 
-El **escalamiento fuerte** fijó el tamaño del problema (un subconjunto representativo fijo de
-`ID`s) y varió $p \in \{1, 2, 4, 8, 16, 32\}$ procesos en CPU (límite de cuenta `cpu=32` en
-KHIPU), registrando $T(p)$, $S(p)$ y $E(p)$ para la fase dominante de entrenamiento. Se obtuvo
-una curva casi lineal mientras $p \le B$ que luego se aplanó, confirmando la predicción
-$p_{\text{eff}} \le B$. En GPU, al disponerse de un solo dispositivo, no hubo barrido de
-escalamiento fuerte: la GPU se evaluó mediante el *roofline* y el barrido de $M$ ya descritos.
+El **escalamiento fuerte** mantiene fijo el tamaño $N$ y aumenta $p$: pregunta cuánto se reduce
+el tiempo de una instancia invariable, por lo que está sujeto al límite de Amdahl
+[@amdahl1967validity]. Se fijó un subconjunto representativo de `ID`s y se varió
+$p \in \{1,2,4,8,16,32\}$ procesos en CPU (límite de cuenta `cpu=32` en KHIPU), registrando
+$T(p)$, $S(p)$ y $E(p)$ para la fase dominante de entrenamiento. La aceleración puede ser
+cercana a lineal solo mientras haya suficiente paralelismo ($p \le B$) y los sobrecostos o
+recursos compartidos no dominen. En GPU, al disponerse de un solo dispositivo, no hubo barrido
+de escalamiento fuerte: la GPU se evaluó mediante el *roofline* y el barrido de $M$ ya
+descritos.
 
-El **escalamiento débil** mantiene constante el trabajo por procesador escalando el número de
-`ID`s entrenados con $p$, es decir $n(p) = n_0 \cdot p$, y reportó
-$E_{\text{weak}}(p) = T(1, n_0) / T(p, n_0 p)$, idealmente igual a 1. Como los ajustes por
-`(ID, doy)` son independientes, se observó buen escalamiento débil en el cómputo; las
-desviaciones aislaron el sobrecosto de E/S y de planificación que crece con el número de
-trabajadores.
+El **escalamiento débil** aumenta el problema junto con los procesadores para mantener
+constante la carga asignada a cada trabajador, criterio relacionado con la aceleración de
+problema escalado de Gustafson [@gustafson1988reevaluating]. Sea $n(p)$ el número de `ID`s
+entrenados; el protocolo usa $n(p)=n_0p$ y reporta
+
+$$
+E_{\text{weak}}(p)=\frac{T(1,n_0)}{T(p,n_0p)}.
+$$
+
+Esta métrica compara ejecuciones con tamaños distintos y sus desviaciones respecto de 1
+cuantifican E/S, planificación y contención de memoria [@kumar1994analyzing]. No es la curva
+teórica discontinua de las gráficas de escalamiento fuerte: esa curva se obtiene manteniendo
+$n$ constante y se deriva en la @sec-eficiencia-teorica.
 
 ### Controles y reportes
 
@@ -461,39 +494,44 @@ retenido). Todas las corridas de entrenamiento son numéricamente equivalentes e
 (verificado a $\max|\Delta| \approx 3\times10^{-15}$), por lo que la elección de hardware
 afecta la **velocidad**, no el resultado científico.
 
-> **Divulgación (política de uso de IA del CIP).** Este análisis y su redacción se apoyaron en
-> un agente de IA generativa (Claude) para orquestación, *benchmarking* y borrador. Todos los
-> valores numéricos provienen de corridas ejecutadas en KHIPU; los hallazgos científicos —en
-> particular la comparación v1.1 vs v1.2— **deben ser validados por un experto temático antes
-> de su publicación o uso operativo.**
-
 Antes de las mediciones se derivan las **curvas teóricas de eficiencia** que sirven de
 referencia, distintas para CPU y GPU porque cada hardware expone el paralelismo en un eje
 diferente: la CPU barre **procesadores $p$** a tamaño fijo, mientras que la única GPU barre el
 **tamaño del problema $M$** con $p = 1$.
 
-## Eficiencia teórica: curvas de referencia
+## Eficiencia teórica: curvas de referencia {#sec-eficiencia-teorica}
 
 ### CPU: modelo de contención de ancho de banda de memoria
 
-El análisis PRAM predice $T_p = O(NDYh/p + \log(Yh))$ para el entrenamiento (con $B \ge 4p$, de
-modo que $\min(p,B)=p$). Si la pérdida de eficiencia se debiera a un sobrecosto fijo aditivo, la
-eficiencia *mejoraría* al crecer $N$; las mediciones muestran lo contrario (las curvas de tres
-tamaños se superponen), de modo que el recurso limitante se consume en proporción al trabajo y
-es **compartido** por los $p$ núcleos: el bus de memoria. Si cada unidad de trabajo requiere
-tiempo de cómputo $t_c$ y mueve $q$ bytes por un bus de ancho de banda $\beta$, entonces
-(@eq-ecpu)
+La curva teórica de CPU se deriva para **tamaño de problema fijo**: sea $n=N$ constante y,
+como $D$, $Y$ y $h$ también permanecen fijos durante el barrido, el trabajo
+$W=nDYh$ es constante. El análisis PRAM predice
+$T_p=O(W/p+\log(Yh))$ cuando $B\ge4p$, de modo que $\min(p,B)=p$. Si la pérdida de eficiencia
+se debiera a un sobrecosto fijo aditivo, este se diluiría al crecer $n$; sin embargo, las
+curvas medidas para tres valores de $n$ casi se superponen. Esto señala un recurso consumido
+en proporción al trabajo y compartido por los núcleos: el bus de memoria.
+
+Si cada unidad de trabajo necesita un tiempo de cómputo $t_c$ y transfiere $q$ bytes a través
+de un bus con ancho de banda $\beta$, el tiempo con $p$ procesadores es
 
 $$
 T_p = \underbrace{\frac{W t_c}{p}}_{\text{cómputo, repartido}}
-    + \underbrace{\frac{W q}{\beta}}_{\text{bus, no repartido}},
+    + \underbrace{\frac{W q}{\beta}}_{\text{bus, no repartido}}.
+$$ {#eq-tp-cpu}
+
+Para un procesador, $T_1=W(t_c+q/\beta)$. Definiendo
+$\gamma=(q/\beta)/t_c$, la aceleración y la eficiencia teóricas son
+
+$$
+S(p)=\frac{T_1}{T_p}=\frac{p(1+\gamma)}{1+\gamma p},
 \qquad
-E(p) = \frac{1+\gamma}{1+\gamma p}, \quad \gamma = \frac{q/\beta}{t_c}.
+E(p)=\frac{T_1}{pT_p}=\frac{1+\gamma}{1+\gamma p}.
 $$ {#eq-ecpu}
 
-El trabajo $W = NDYh$ **se cancela**: un único $\gamma$ describe todos los tamaños (justo la
-superposición observada). Asintóticamente $E(p) = O(1/p)$ y la aceleración satura en
-$S(\infty) = 1 + 1/\gamma$. Un ajuste por mínimos cuadrados sobre los tres tamaños dio
+Aunque la derivación mantiene $n$ constante, el trabajo $W=nDYh$ **se cancela** en el cociente:
+un único $\gamma$ describe todos los tamaños, coherente con la superposición observada.
+Asintóticamente, para $p\gg1/\gamma$, $E(p)=O(1/p)$ y la aceleración satura en
+$S(\infty)=1+1/\gamma$. Un ajuste por mínimos cuadrados sobre los tres tamaños dio
 $\gamma \approx 0.063$ (los fallos de memoria cuestan ~6 % del tiempo de cómputo por unidad de
 trabajo) y $S(\infty) \approx 17$.
 
@@ -572,16 +610,25 @@ curva teórica ajustada de la @eq-ecpu con $\gamma = 0.063$.
 : Eficiencia $E(p)$ del entrenamiento por tamaño de problema, con la curva teórica del modelo de
 contención. {#tbl-cpu}
 
+::: {layout-ncol=2}
+![Tiempo de pared del entrenamiento frente al número de procesos para 512, 1024 y 2048 `ID`s.](reports/figs/cpu/family_time_v12_cpu_train.png){#fig-cpu-time}
+
+![Aceleración observada frente al número de procesos para los tres tamaños de problema.](reports/figs/cpu/family_speedup_v12_cpu_train.png){#fig-cpu-speedup}
+:::
+
+![Eficiencia paralela frente al número de procesos. Las curvas de los tres tamaños casi se superponen; la línea roja discontinua representa el modelo de contención de memoria ajustado $E(p)=(1+\gamma)/(1+\gamma p)$.](reports/figs/cpu/family_efficiency_v12_cpu_train.png){#fig-cpu-eff width=78%}
+
 El rendimiento por núcleo es constante (~2.0 s/`ID` en un núcleo, independiente del tamaño), de
 modo que el tiempo es lineal en el problema. La eficiencia se mantuvo alta hasta ~4–8 núcleos y
 luego cayó —no por desbalance ni sobrecosto fijo (un problema mayor los diluiría), sino porque
-todos los núcleos compiten por el **mismo bus de memoria**—: la eficiencia de escalamiento débil
-a 32 núcleos ($\approx 0.35$) coincide con la de escalamiento fuerte a 32, firma de una carga
+todos los núcleos compiten por el **mismo bus de memoria**—: la eficiencia medida a 32 núcleos
+($\approx 0.35$) es la firma de una carga
 **limitada por ancho de banda**. El modelo $E(p)=(1+\gamma)/(1+\gamma p)$ con $\gamma \approx
 0.063$ reproduce las mediciones dentro de pocos puntos porcentuales. El punto óptimo práctico es
 **$p \approx 8$** (eficiencia $\approx 0.70$); 32 núcleos dan el mejor tiempo de pared pero a
 aproximadamente un tercio de la eficiencia, con una aceleración que sigue trepando hacia el
-techo $S(\infty) \approx 17$ (medida $\approx 11\times$ a $p=32$).
+techo $S(\infty) \approx 17$ (medida $\approx 11\times$ a $p=32$; @fig-cpu-speedup). La
+@fig-cpu-eff muestra que el mismo modelo de contención explica los tres tamaños del problema.
 
 ## Resultados en GPU (Trabajo B)
 
@@ -601,12 +648,24 @@ Cholesky $5\times5$ de un hilo por ajuste)—. La @tbl-gpu resume el desempeño 
 
 : Desempeño de la GPU en un solo dispositivo. {#tbl-gpu}
 
+::: {layout-ncol=2}
+![*Roofline* del pipeline de entrenamiento. Todas las etapas quedan por debajo del techo de cómputo y en la región limitada por ancho de banda.](reports/figs/gpu/gpu_roofline.png){#fig-gpu-roofline}
+
+![Ajuste del tamaño de bloque del kernel *solve*; 32 hilos por bloque fue la mejor configuración en la partición evaluada.](reports/figs/gpu/gpu_block_tuning.png){#fig-gpu-block}
+:::
+
+::: {layout-ncol=2}
+![Tiempo de cada etapa frente al tamaño del problema $M$. Las líneas discontinuas son el piso teórico de ancho de banda $T_{\text{bound}}(M)=Q(M)/\beta$.](reports/figs/gpu/gpu_pipeline_time_vs_M.png){#fig-gpu-time}
+
+![Rendimiento del kernel *solve* frente a $M$: la tasa de ajustes por segundo aumenta hasta saturar el dispositivo.](reports/figs/gpu/gpu_throughput.png){#fig-gpu-throughput}
+:::
+
 Todas las etapas se sitúan muy por debajo del vértice del *roofline*, por lo que el pipeline
 está **limitado por ancho de banda, no por cómputo** —lo esperable para estos sistemas lineales
 diminutos—. Aun así, el rendimiento bruto es enorme ($\approx 2\times10^9$ ajustes/s) y el
 dominio completo de 300 000 puntos se entrenó en menos de 15 minutos. La curva de tiempo vs $M$
 crece linealmente por encima de una oleada, y su cota teórica es el piso de ancho de banda
-$T_{\text{bound}} = Q(M)/\beta$ de la @eq-egpu.
+$T_{\text{bound}} = Q(M)/\beta$ de la @eq-egpu, como se observa en la @fig-gpu-time.
 
 **CPU frente a GPU.** Sobre una base de costo por `ID` entrenado: CPU 1 núcleo
 $\approx 2.0$ s/`ID` ($1\times$), CPU 32 núcleos $\approx 0.18$ s/`ID` ($\approx 11\times$) y GPU
@@ -615,6 +674,8 @@ $\approx 60\times$ más rápida que un nodo CPU de 32 núcleos plenamente cargad
 **pronóstico**, en cambio, es autorregresivo (cada día predicho alimenta los rezagos del
 siguiente), inherentemente secuencial y en Python/pandas puro, por lo que la GPU **no lo
 acelera**; solo queda paralelizarlo entre `ID`s independientes en CPU.
+
+![Costo de entrenamiento por `ID` en escala logarítmica (menor es mejor). La comparación usa el costo por `ID` porque los *benchmarks* de CPU y GPU se ejecutaron con tamaños de problema distintos.](reports/figs/gpu/cpu_vs_gpu_per_id.png){#fig-cpuvsgpu width=85%}
 
 ## Comparación PISCOt v1.1 vs v1.2 (Trabajo C)
 
@@ -628,6 +689,18 @@ contra la TD observada), ambas versiones producen modelos muy similares (@tbl-ac
 
 : Habilidad del pronóstico frente a la TD observada; $\Delta$RMSE (v1.2−v1.1) $= +0.0089$
 (~0.8 %). {#tbl-acc}
+
+::: {layout-ncol=2}
+![RMSE mensual del pronóstico retenido, PISCOt v1.1 frente a v1.2.](reports/figs/cmp/monthly_rmse.png){#fig-monthly-rmse}
+
+![Distribución de la diferencia v1.2−v1.1 del coeficiente de la anomalía de TMIN, la mayor diferencia entre los modelos.](reports/figs/cmp/delta_hist_TMIN_anom_coeff.png){#fig-tmin-coeff}
+:::
+
+::: {layout-ncol=2}
+![Temperatura de punto de rocío predicha frente a la observada con PISCOt v1.1.](reports/figs/cmp/pred_vs_obs_v1.1.png){#fig-pred-obs-v11}
+
+![Temperatura de punto de rocío predicha frente a la observada con PISCOt v1.2.](reports/figs/cmp/pred_vs_obs_v1.2.png){#fig-pred-obs-v12}
+:::
 
 Ambas versiones dan idéntica cobertura (7.32 M ajustes) y modelos muy parecidos: la mayor
 diferencia está en la **sensibilidad a la anomalía de TMIN** (`TMIN_anom_coeff`: v1.1 = 0.452 vs
@@ -675,7 +748,7 @@ núcleos** para la mejor eficiencia ($\approx 0.70$), o hasta 32 para el mejor t
 #counter(heading).update(0)
 ```
 
-# Pseudocódigo PRAM y análisis de complejidad completos
+# Pseudocódigo PRAM y análisis de complejidad completos {#sec-apendice-pram}
 
 Este apéndice reproduce de forma íntegra el documento técnico de pseudocódigo en el modelo
 PRAM y el análisis de complejidad del pipeline. Detalla los nueve algoritmos (climatología,

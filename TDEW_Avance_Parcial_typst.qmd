@@ -1,0 +1,688 @@
+---
+title: "Estimación de la temperatura de punto de rocío (TDEW) a partir de la temperatura mínima sobre PISCOt"
+subtitle: "Motivación, problema y metodología: regresión lineal local sobre anomalías con un diseño paralelo bucket-año"
+author:
+  - name: Piero Palacios Bernuy
+  - name: Estuardo Oliver Campos
+  - name: Diego Sánchez Salazar
+  - name: Gianmarco Mejía
+date: last-modified
+lang: es
+abstract: |
+  La temperatura de punto de rocío (TDEW, en adelante TD) es una variable climática
+  fundamental: determina la presión de vapor real del aire y, con ello, la formación de
+  rocío, el riesgo de heladas y la duración del período de humectación foliar que controla
+  la infección por patógenos fúngicos en los cultivos. Como la TD rara vez se mide de forma
+  directa en redes meteorológicas extensas, debe estimarse a partir de variables más
+  disponibles, típicamente la temperatura mínima diaria (TMIN). Este trabajo aborda dicha
+  estimación sobre el conjunto de datos grillados PISCOt para el Perú, comparando sus
+  versiones v1.1 y v1.2, lo que implica ajustar un modelo para del orden de 300 000
+  ubicaciones espaciales a lo largo de cerca de 40 años de registro diario. Proponemos un
+  modelo de regresión lineal local ponderada sobre anomalías, analizado en el modelo PRAM
+  (variante CREW) e implementado con un rediseño *bucket-año* que reduce drásticamente el
+  sobrecosto de entrada/salida (E/S). Finalmente, se ejecutó un protocolo experimental de
+  escalamiento fuerte y débil que midió tiempo de ejecución, aceleración y eficiencia en CPU
+  (barrido de 1 a 32 procesos) y, en GPU, sobre una única partición A100 MIG (`a100_3g.20gb`)
+  caracterizada por su rendimiento y su *roofline*, de forma idéntica sobre PISCOt v1.1 y v1.2.
+  Los resultados confirmaron el modelo teórico: en CPU la eficiencia decae como $O(1/p)$ por
+  contención del bus de memoria (techo de aceleración $S(\infty) \approx 17$), mientras que en
+  GPU el pipeline está limitado por ancho de banda y el entrenamiento del dominio completo de
+  $\approx 300\,000$ puntos tomó $\approx 14.7$ minutos en una sola GPU.
+
+  *__Palabras clave:__ temperatura de punto de rocío, temperatura mínima, regresión lineal
+  local, anomalías climáticas, PISCOt, PRAM, escalamiento HPC, enfermedades fúngicas.*
+format:
+  typst:
+    toc: true
+    toc-title: "Contenido"
+    toc-depth: 2
+    number-sections: true
+    section-numbering: "1.1.1"
+    papersize: a4
+    fontsize: 11pt
+    mainfont: "New Computer Modern"
+    margin:
+      x: 2.5cm
+      y: 2.5cm
+    include-in-header: typst-preamble.typ
+bibliography: references.bib
+csl: apa.csl
+citeproc: true
+# `citeproc: true` fuerza el procesamiento de citas con Pandoc (en lugar del motor
+# nativo de Typst). Así la bibliografía APA se inserta en el div `::: {#refs}` bajo
+# la sección "Referencias" —antes del apéndice— y no al final como "Bibliografía".
+---
+
+# Introducción
+
+## La importancia de la temperatura de punto de rocío
+
+La temperatura de punto de rocío es la temperatura a la cual el aire debe enfriarse, a
+presión constante, para que el vapor de agua que contiene alcance la saturación y comience
+a condensarse. Es, por tanto, una medida directa del contenido de humedad del aire y fija la
+presión de vapor real empleada en el cálculo del balance hídrico y de la evapotranspiración
+de referencia mediante la ecuación de Penman–Monteith [@allen1998crop]. Su relevancia
+abarca desde la hidrología y la predicción de heladas hasta, de manera especialmente
+crítica, la fitopatología agrícola.
+
+El vínculo con la sanidad vegetal es directo. La mayoría de los hongos y bacterias
+fitopatógenos requieren agua líquida libre sobre la superficie de la planta para germinar e
+infectar; esa agua proviene de la lluvia, la niebla y, sobre todo, del rocío, que se forma
+cuando la temperatura de la superficie foliar desciende por debajo del punto de rocío del
+aire circundante [@huber1992modeling]. La **duración del período de humectación foliar**
+—principal predictor del riesgo de infección— suele estimarse a partir de variables
+meteorológicas como la depresión del punto de rocío y la humedad relativa, precisamente
+porque medirla de forma directa es costoso [@sentelhas2008suitability]. En consecuencia,
+disponer de campos espacialmente continuos y fiables de TD es un insumo de primer orden para
+los sistemas de alerta temprana de enfermedades.
+
+Este punto es particularmente importante en el contexto peruano y andino. La papa, cultivo
+estratégico para la seguridad alimentaria de la región, es severamente afectada por el tizón
+tardío (*Phytophthora infestans*), cuya tasa de infección y esporulación depende de manera
+estrecha de la temperatura y de la humedad: las noches frescas con rocío abundante seguidas
+de días húmedos constituyen las condiciones ideales para la epidemia
+[@narouei2020blightsim]. Los modelos mecanicistas de pronóstico de tizón se alimentan
+explícitamente de series de temperatura y humedad, de modo que la calidad de las
+estimaciones de TD condiciona directamente la utilidad de estas herramientas de gestión.
+
+## El conjunto de datos PISCOt
+
+PISCOt es el producto grillado de temperatura del aire para el Perú desarrollado por el
+Servicio Nacional de Meteorología e Hidrología (SENAMHI) dentro de la familia PISCO
+(*Peruvian Interpolated data of SENAMHI's Climatological and hydrological Observations*).
+Su versión más reciente, PISCOt v1.2, ofrece grillas diarias de temperatura del aire
+(máxima y mínima) a una resolución espacial de 0.01° para todo el territorio nacional en el
+período 1981–2020 [@huerta2023high]. La construcción del producto sigue cuatro etapas:
+control de calidad, relleno de vacíos, homogeneización de las estaciones y, finalmente,
+interpolación espacial; la versión v1.2 mejora sobre la v1.1 mediante datos adicionales, una
+secuencia de cálculo revisada y un control de versiones más estricto [@huerta2023high].
+
+Para este proyecto, PISCOt aporta la variable predictora (TMIN) sobre una grilla densa y
+homogénea. La temperatura de punto de rocío, en cambio, tiene una disponibilidad limitada e
+inconsistente entre versiones: **PISCOt v1.1 incluye TD solo hasta 2016, mientras que PISCOt
+v1.2 no incluye TD en absoluto**. Esta cobertura parcial es precisamente lo que motiva
+estimar la TD a partir de la TMIN, de modo que se obtenga un campo de TD completo y
+homogéneo para todo el período y coherente entre ambas versiones del producto. Comparar v1.1
+y v1.2 permite además evaluar cómo los cambios en el producto subyacente se propagan al
+modelo de TD estimado.
+
+## El problema a resolver
+
+El objetivo es estimar la TD diaria para cada celda de la grilla PISCOt usando la TMIN como
+predictor principal. La escala es masiva: del orden de $N \approx 300\,000$ ubicaciones
+espaciales (identificadas por un `ID`) a lo largo de $Y \approx 40$ años de registro diario,
+lo que supone del orden de miles de millones de registros por variable climática.
+
+El reto no es solo de volumen, sino también estadístico. La temperatura cruda —tanto TD como
+TMIN— posee un ciclo estacional fuerte y predecible: cada ubicación es más cálida en verano
+y más fría en invierno. Si se modelara la TD cruda frente a la TMIN cruda, gran parte de la
+relación aparente sería simplemente el reflejo de que ambas variables siguen las estaciones,
+y no el acoplamiento físico genuino entre humedad y temperatura que interesa capturar. Por
+ello se trabaja sobre **anomalías**, restando a cada observación el valor típico de su
+ubicación para ese día del año (su climatología), tal como se define en la @eq-anom:
+
+$$
+\begin{aligned}
+TD_{anom}(t)   &= TD(t) - TD_{clim}(ID, doy), \\
+TMIN_{anom}(t) &= TMIN(t) - TMIN_{clim}(ID, doy).
+\end{aligned}
+$$ {#eq-anom}
+
+Modelar la relación día a día por separado para cada par `(ID, doy)` genera del orden de
+$N \times D \approx 300\,000 \times 366 \approx 1.1 \times 10^{8}$ ajustes de regresión
+independientes. Cada ajuste es diminuto, pero su número total convierte el cómputo en un
+problema intensivo que exige un diseño paralelo cuidadoso y motiva tanto el análisis de
+complejidad como los experimentos de escalamiento descritos en la metodología.
+
+## Contribución y estructura
+
+El trabajo propone (i) un modelo de regresión lineal local ponderada sobre anomalías para
+estimar TD a partir de TMIN; (ii) un rediseño **bucket-año** del flujo de datos que elimina
+el reescaneo repetido de archivos fuente del enfoque anterior; (iii) un análisis de
+complejidad en el modelo PRAM que predice el rendimiento en clústeres de cómputo de alto
+desempeño (HPC); y (iv) un protocolo experimental que mide el escalamiento fuerte y débil en
+CPU y GPU sobre las dos versiones de PISCOt. La Sección de Metodología detalla los datos, el
+modelo estadístico, el modelo PRAM con su pseudocódigo y análisis de complejidad, la
+implementación y el diseño experimental.
+
+# Metodología
+
+## Datos y variables
+
+La unidad de análisis es la celda de grilla (`ID`). De PISCOt [@huerta2023high] se toman las
+series diarias de TMIN (predictor) y TD (objetivo) para cada `ID` durante el período de
+entrenamiento. Todo el protocolo se ejecuta de forma idéntica sobre PISCOt v1.1 y v1.2,
+suministrando cada versión al mismo pipeline mediante parámetros de ruta de entrada y
+escribiendo a raíces de resultados separadas, de modo que no difiere ningún código entre
+ejecuciones.
+
+Para cada `ID` y día del año `doy` se define la climatología como la media histórica de cada
+variable, y las anomalías como la desviación respecto de dicha climatología. La regresión se
+ajusta sobre las anomalías, eliminando así el ciclo estacional. La notación empleada en todo
+el documento se resume en la @tbl-simbolos.
+
+| Símbolo | Significado | Valor típico |
+|:-------:|:------------|:------------:|
+| $N$ | Número de ubicaciones espaciales (`ID`s) | $\approx 300\,000$ |
+| $Y$ | Años de entrenamiento | $\approx 40$ |
+| $D$ | Días por año | $\le 366$ |
+| $B$ | Número de buckets de `ID` | p. ej. 1024 |
+| $p$ | Procesadores / trabajadores | variable |
+| $h$ | Semiventana local de `doy` | 11 |
+| $F$ | Coeficientes de regresión (intercepto + predictores) | 5 |
+| $m$ | Muestras por regresión local | $O(Yh)$ |
+
+: Símbolos y parámetros del modelo. {#tbl-simbolos}
+
+## Modelo de regresión lineal local
+
+El núcleo estadístico es una **regresión lineal local ponderada**: un método de regresión no
+paramétrica que, en lugar de ajustar una sola recta global, ajusta un modelo lineal simple
+dentro de una vecindad local de cada punto, ponderando las observaciones según su cercanía
+mediante una función de kernel [@cleveland1979robust; @fan1996local]. El diseño de este
+trabajo se inspira directamente en @hwang2019improving, quienes incorporan características de
+vecinos más cercanos (*nearest-neighbor*) dentro de una regresión lineal local ponderada para
+mejorar el pronóstico subestacional de temperatura y precipitación en el oeste de Estados
+Unidos. Para estimar el modelo de la ubicación `i` en el día
+del año `d`, no se usan únicamente las observaciones del día `d` —demasiado escasas a lo
+largo de 40 años—, sino todas aquellas cuyo día del año cae dentro de una **ventana circular
+local** de semianchura `h` alrededor de `d`, de modo que el día 365 es vecino del día 1. Las
+observaciones más próximas a `d` reciben mayor influencia mediante un peso **tricube** que
+decae suavemente hasta cero en el borde de la ventana (@eq-tricube):
+
+$$
+w(t) = \left(1 - \left|\frac{\delta(doy(t),\, d)}{h}\right|^{3}\right)^{3},
+\qquad \text{para } |\delta| \le h,
+$$ {#eq-tricube}
+
+donde $\delta$ es la distancia circular entre días del año. Sobre esa vecindad ponderada se
+resuelve una regresión por mínimos cuadrados ponderados de la anomalía de TD sobre la
+anomalía de TMIN y unas pocas características de rezago (`TD_anom_lag1`, `TD_anom_lag2`,
+`TMIN_anom_lag1`), obteniendo el vector de coeficientes $\beta$ que se almacena para
+`(i, d)`. Con $F = 5$ coeficientes (intercepto más 4 predictores) y $m = O(Yh)$ muestras de
+vecindad por ajuste, cada ajuste resuelve el sistema de ecuaciones normales
+
+$$
+(X^{\top} W X)\,\beta = X^{\top} W y .
+$$ {#eq-ols}
+
+## Modelo PRAM y notación de complejidad
+
+El análisis paralelo se realiza en el modelo **PRAM** (Máquina de Acceso Aleatorio Paralela),
+el marco idealizado estándar para razonar sobre algoritmos paralelos
+[@jaja1992introduction; @cormen2009introduction]. Se usa la variante **CREW** (*Concurrent
+Read, Exclusive Write*), que se ajusta de forma natural a este pipeline: muchos procesadores
+pueden leer concurrentemente las mismas tablas de entrada (lectura concurrente), mientras que
+cada trabajador es dueño de un bucket / `ID` / día del año de salida disjunto, de modo que
+nunca colisionan dos escrituras (escritura exclusiva). Las reducciones (sumas, medias,
+conteos) combinan $m$ valores en aproximadamente $\log m$ pasos mediante un árbol de sumas
+por pares. La anotación `pardo` marca los bucles cuyas iteraciones son independientes y, por
+tanto, paralelizables.
+
+Cada algoritmo se describe con tres costos [@jaja1992introduction]: el **trabajo** $W$
+(número total de operaciones, independiente del número de procesadores), el **tiempo
+paralelo** $T_p$ con $p$ procesadores, y el **span** $T_\infty$ (camino crítico, el tiempo
+con procesadores ilimitados). La forma recurrente del tiempo paralelo es
+
+$$
+T_p \approx \frac{W}{p_{\text{eff}}} + \text{sobrecosto (coordinación, E/S, dependencias)} .
+$$
+
+El **diseño bucket-año** es la decisión arquitectónica central. Un *bucket* es un grupo
+determinista de `ID`s definido por `bucket = ID mod B`. En lugar de que cada uno de los
+~300 000 `ID`s vuelva a abrir los mismos archivos mensuales históricos, los datos se agrupan
+una sola vez en $B$ buckets y se compactan por año; después, cada trabajador lee los archivos
+compactos de su bucket una única vez, convirtiendo una tormenta de lecturas diminutas y
+repetidas en unas pocas lecturas secuenciales grandes. La principal consecuencia es que el
+paralelismo efectivo de las etapas de cómputo queda acotado por el número de buckets,
+$p_{\text{eff}} \le B$.
+
+## Pipeline completo
+
+El pipeline encadena nueve algoritmos; cada uno se ejecuta en secuencia, pero es internamente
+paralelo. El Algoritmo 1 da la vista general.
+
+**Algoritmo 1 — Pipeline completo de TDEW.**
+
+```text
+Algorithm TDEW-PIPELINE
+Input:
+  TD, TMIN monthly files for all IDs and dates; Grid of expected IDs
+  Parameters: B buckets, h local DOY half-window, p processors
+Output:
+  climatology; bucket-year training dataset;
+  regression coefficients per (ID, doy); optional repairs; optional TD predictions
+
+1  climatology        <- BUILD-CLIMATOLOGY(TD, TMIN)
+2  bucketed_training  <- BUILD-BUCKET-YEAR-DATASET(TD, TMIN, B)
+3  bucketed_clim      <- SHARD-CLIMATOLOGY(climatology, B)
+4  coefficients       <- TRAIN-COEFFICIENTS(bucketed_training, bucketed_clim, h, B)
+5  incomplete_doys    <- CHECK-COMPLETENESS(coefficients, Grid)
+6  if incomplete_doys is not empty then
+7      patch          <- RERUN-FAILED-DOYS(bucketed_training, bucketed_clim, incomplete_doys, h, B)
+8      coefficients   <- PATCH-COEFFICIENTS(coefficients, patch, incomplete_doys)
+9  end if
+10 if forecasting requested then
+11     bucketed_future_tmin <- SHARD-FUTURE-TMIN(TMIN_future, B)
+12     predictions    <- FORECAST-TD(coefficients, bucketed_clim, bucketed_training,
+                                     bucketed_future_tmin, H, B)
+13 end if
+14 return coefficients, predictions
+```
+
+El flujo aprende primero los valores normales estacionales de cada ubicación (climatología,
+línea 1); reorganiza los archivos crudos en archivos compactos por bucket (líneas 2–3);
+ajusta las regresiones locales que constituyen la salida científica (línea 4); ejecuta un
+control de calidad que reentrena solo los días faltantes (líneas 5–9); y, opcionalmente,
+proyecta el modelo hacia adelante sobre un horizonte futuro (líneas 10–13).
+
+## Algoritmo dominante: entrenamiento de coeficientes
+
+La etapa que domina el costo es el ajuste de las regresiones locales. Para cada `ID` y cada
+día del año objetivo, se reúne la vecindad circular de días, se eliminan filas incompletas,
+se ponderan con el kernel tricube y se resuelve la regresión.
+
+**Algoritmo 2 — Entrenamiento de coeficientes de anomalía.**
+
+```text
+Algorithm TRAIN-COEFFICIENTS
+Input: bucket-year training dataset; bucketed climatology; half-window h; buckets B
+Output: coefficients per (ID, doy)
+
+1  for each bucket b in 0..B-1 pardo do
+2      train_b <- read bucket-year training rows for bucket b
+3      clim_b  <- read climatology rows for bucket b
+4      for each ID i in bucket b pardo do
+5          compute TD_anom, TMIN_anom for i (subtract climatology)
+6          create lag features (TD_anom_lag1, TD_anom_lag2, TMIN_anom_lag1)
+7          for each target day d in 1..366 pardo do
+8              N_d <- rows with circular_distance(doy, d) <= h, complete cases
+9              if size(N_d) >= minimum_sample_count then
+10                 weight(t) <- tricube(circular_distance(doy(t), d) / h)
+11                 beta <- weighted_least_squares(N_d)
+12                 write coefficients for (ID i, doy d)
+13             end if
+14         end for
+15     end for
+16     write coefficient file for bucket b
+17 end for
+18 return coefficient dataset
+```
+
+Como $F = 5$ es constante, un ajuste cuesta $W_{\text{one-fit}} = O(m F^{2} + F^{3}) = O(m) =
+O(Yh)$. El trabajo total del entrenamiento es, pues, el costo de un ajuste multiplicado por
+el número de ajustes ($N$ ubicaciones $\times$ $D$ días del año), según la @eq-wtrain:
+
+$$
+W_{\text{train}} = O(N\,D\,Y\,h).
+$$ {#eq-wtrain}
+
+Con procesadores ilimitados el span es $T_\infty = O(\log m + F^{3})$ —el algoritmo es
+extremadamente "ancho"—, mientras que con $p$ procesadores y $B$ tareas de bucket el tiempo
+práctico es
+
+$$
+T_p = O\left(\frac{N D Y h}{\min(p, B)} + \text{sobrecosto de E/S}\right).
+$$
+
+## Complejidad global
+
+Sumando las fases dominantes (preprocesamiento bucket-año y entrenamiento completo), con
+$R = NYD$, el trabajo total es
+
+$$
+W_{\text{total}} = O\left(R \log\left(\frac{ND}{B}\right) + N D Y h\right) = O(N D Y h),
+$$
+
+ya que el factor $h$ de la regresión local es el multiplicador dominante. El tiempo paralelo
+práctico combina las fases limitadas por entrada/salida (E/S, es decir, lectura y escritura
+de archivos en disco; que escalan con $/p$) y las etapas de cómputo bucket-paralelas (que
+escalan con $/\min(p, B)$). La @tbl-complejidad recopila los costos por fase.
+
+| Fase | Trabajo secuencial $W$ | Tiempo paralelo $T_p$ |
+|:-----|:----------------------:|:---------------------:|
+| Construir climatología | $O(R)$ | $O(R/p + \log R)$ |
+| Dataset bucket-año | $O(R \log(ND/B))$ | $O(R/p + \log(ND/B))$ |
+| Entrenar coeficientes | $O(NDYh)$ | $O(NDYh / \min(p,B))$ |
+| Verificar completitud | $O(ND)$ | $O(ND/p + \log(ND))$ |
+| Reparar $Q$ DOYs | $O(NQYh)$ | $O(NQYh / \min(p,B))$ |
+| Pronóstico (horizonte $H$) | $O(NH)$ | $O(NH / \min(p,B) + H)$ |
+
+: Trabajo y tiempo paralelo por fase del pipeline. {#tbl-complejidad}
+
+El cuello de botella práctico tras el rediseño es $O(NDYh)$; el aporte del bucket-año es,
+sobre todo, eliminar la E/S repetida del enfoque anterior, no reducir el trabajo estadístico.
+
+## Implementación y ejecución de los experimentos
+
+La implementación se apoya en **Dask** para la planificación de tareas y la paralelización,
+en CPU (mediante `dask_jobqueue.SLURMCluster`) y, en GPU, ejecutándose en proceso sobre una
+única partición A100 MIG (sin `dask-cuda`) [@rocklin2015dask]. Conviene distinguir dos niveles de paralelismo. El **nivel externo**
+(bucket) es el número de buckets que corren a la vez, acotado por $\min(p, B)$: en CPU, $p$
+es el número de procesos trabajadores de un hilo (≈ núcleos); en GPU fue un solo
+dispositivo (la partición A100 MIG disponible). El **nivel interno** (ajuste) es cuántos de los
+$\approx (N/B)\,D$ ajustes de un bucket se evalúan juntos: en CPU es uno a la vez (BLAS
+fijado a un hilo), mientras que una GPU ensambla y resuelve del orden de $10^{5}$ sistemas
+$5\times5$ en una sola llamada por lotes. Por ello la CPU prefiere **muchos** buckets
+($B \ge 4p$) para mantener ocupados los núcleos, mientras que la GPU prefiere buckets **lo
+bastante grandes** como para llenar cada lote.
+
+### Qué cuenta como un procesador `p`
+
+El eje de escalamiento `p` cuenta **trabajadores independientes**, no hilos, para que $S(p)$
+y $E(p)$ signifiquen lo mismo en ambos hardwares. En CPU, un trabajador es un proceso Dask de
+un solo hilo (un núcleo, con las bibliotecas BLAS fijadas a un hilo mediante
+`OMP_NUM_THREADS=1`), y `p` se varía escalando el número de procesos con
+`dask_jobqueue.SLURMCluster`. En el estudio de GPU, en cambio, el despliegue objetivo (KHIPU) expuso **una única partición
+A100 MIG** (`a100_3g.20gb`; límite de cuenta `gres/gpu=1`), por lo que **no hubo barrido de
+`p` en GPU** ($p_{GPU}=1$ siempre) y reportar $S(p)$/$E(p)$ sobre GPUs no resulta significativo
+aquí; la GPU se caracterizó por su **rendimiento y un *roofline*** al crecer el tamaño del
+problema (eje $M$), no por un barrido de procesadores.
+
+El paralelismo *interno* de la GPU —los miles de hilos CUDA y su organización en bloques—
+**no se expone como `p` ni se barre como eje de escalamiento**. La ruta de producción es un
+kernel CUDA propio (`solve5`: una resolución de Cholesky $5\times5$ en registros, **un hilo por
+ajuste**) que recibe los $\approx 10^{5}$ sistemas $5\times5$ de un bucket y los reparte entre
+los multiprocesadores (SM) del dispositivo. El número de hilos por bloque es un parámetro de
+lanzamiento fijo (128 en este estudio), afinado una sola vez; cambiarlo no altera los
+resultados, solo el tiempo de reloj. Esa configuración intra-dispositivo se mantiene fija
+durante todo el estudio y se absorbe en la constante $c$ del modelo
+$T_p = c\,(W / p_{\text{eff}}) + \text{sobrecosto}$, por lo que no es la variable de
+escalamiento. (El solucionador *batched* de cuSOLVER vía CuPy se usa solo como oráculo de
+verificación numérica, no en producción.)
+
+Lo único que controla la *carga* ofrecida a una sola GPU es el **ancho de lote** $M$: el
+número de ajustes resueltos por llamada al kernel, igual al número de ajustes por bucket,
+$M \approx (N/B)\,D$. Como hay **un hilo CUDA por ajuste**, $M$ es el análogo directo del eje
+$Q$ (número de hilos) de la teoría de *oleadas*: mientras $M$ cabe en los hilos residentes del
+dispositivo el tiempo es casi plano, pero al superar esa capacidad el trabajo se parte en
+oleadas sucesivas y el tiempo crece de forma lineal con $M$. En la partición MIG empleada
+(`a100_3g.20gb`, 42 SM) el kernel compilado usa 127 registros por hilo, de modo que la presión
+de registros —y no el límite nominal de 2048 hilos/SM— fija la ocupancia: caben 512 hilos por SM
+y el dispositivo mantiene $42 \times 512 = 21\,504$ ajustes en vuelo a la vez (véase la
+subsección de granularidad de oleadas en Resultados). La saturación real aparece, por tanto, por
+debajo del máximo teórico.
+Por ello, como estudio complementario al barrido de `p`, se **barre el ancho de lote $M$**
+(equivalentemente, se reduce `B`, pues $M \approx (N/B)\,D$) para localizar el punto en que una
+sola A100 se satura. Ese barrido de tamaño caracteriza el nivel interno de paralelismo sin
+alterar el eje `p` —que sigue siendo el número de GPUs—, y es independiente del número de hilos
+por bloque, un detalle de lanzamiento que se afina por separado.
+
+### Cantidades medidas
+
+Para un tamaño de problema fijo, con $T(p)$ el tiempo de reloj usando $p$ procesadores, se
+reportan tres cantidades estándar de rendimiento paralelo:
+
+$$
+\text{Tiempo: } T(p), \qquad
+\text{Aceleración: } S(p) = \frac{T(1)}{T(p)}, \qquad
+\text{Eficiencia: } E(p) = \frac{S(p)}{p}.
+$$
+
+La aceleración ideal es $S(p) = p$ y la eficiencia ideal $E(p) = 1$. El análisis PRAM predice
+la desviación: como las etapas de entrenamiento son bucket-paralelas con $p_{\text{eff}} \le
+B$, la eficiencia se mantiene alta mientras $p \le B$ y luego se degrada.
+
+### Escalamiento fuerte y débil
+
+El **escalamiento fuerte** fijó el tamaño del problema (un subconjunto representativo fijo de
+`ID`s) y varió $p \in \{1, 2, 4, 8, 16, 32\}$ procesos en CPU (límite de cuenta `cpu=32` en
+KHIPU), registrando $T(p)$, $S(p)$ y $E(p)$ para la fase dominante de entrenamiento. Se obtuvo
+una curva casi lineal mientras $p \le B$ que luego se aplanó, confirmando la predicción
+$p_{\text{eff}} \le B$. En GPU, al disponerse de un solo dispositivo, no hubo barrido de
+escalamiento fuerte: la GPU se evaluó mediante el *roofline* y el barrido de $M$ ya descritos.
+
+El **escalamiento débil** mantiene constante el trabajo por procesador escalando el número de
+`ID`s entrenados con $p$, es decir $n(p) = n_0 \cdot p$, y reportó
+$E_{\text{weak}}(p) = T(1, n_0) / T(p, n_0 p)$, idealmente igual a 1. Como los ajustes por
+`(ID, doy)` son independientes, se observó buen escalamiento débil en el cómputo; las
+desviaciones aislaron el sobrecosto de E/S y de planificación que crece con el número de
+trabajadores.
+
+### Controles y reportes
+
+Para garantizar mediciones reproducibles y justas: la línea base $T(1)$ usó un único
+trabajador con un hilo y los pools de BLAS fijados a 1; el número de buckets se mantuvo en
+$B \ge 4\,p_{\max}$ durante todo el barrido; cada punto se ejecutó varias veces y se reportó
+la mediana; el almacenamiento temporal fue a disco local rápido del nodo; y se distinguió entre
+caché caliente y fría. El protocolo completo se ejecutó sobre **PISCOt v1.1 y v1.2**,
+comparando tanto el rendimiento (curvas $T(p)$, $S(p)$, $E(p)$) como la ciencia
+(distribuciones de los coeficientes ajustados y de la habilidad predictiva), para evaluar
+cómo la versión del dataset afecta al modelo estimado con independencia del tiempo de
+ejecución.
+
+# Resultados
+
+El protocolo descrito se ejecutó en su totalidad sobre el clúster **KHIPU** (UTEC; OpenHPC +
+Slurm), en tres trabajos: **Trabajo A** (CPU: escalamiento fuerte y débil del entrenamiento
+sobre un subconjunto de `ID`s, v1.2), **Trabajo B** (GPU: *roofline* y modelo de 300 000
+puntos, v1.2) y **Trabajo C** (comparación de habilidad predictiva v1.1 vs v1.2 sobre un año
+retenido). Todas las corridas de entrenamiento son numéricamente equivalentes en CPU y GPU
+(verificado a $\max|\Delta| \approx 3\times10^{-15}$), por lo que la elección de hardware
+afecta la **velocidad**, no el resultado científico.
+
+> **Divulgación (política de uso de IA del CIP).** Este análisis y su redacción se apoyaron en
+> un agente de IA generativa (Claude) para orquestación, *benchmarking* y borrador. Todos los
+> valores numéricos provienen de corridas ejecutadas en KHIPU; los hallazgos científicos —en
+> particular la comparación v1.1 vs v1.2— **deben ser validados por un experto temático antes
+> de su publicación o uso operativo.**
+
+Antes de las mediciones se derivan las **curvas teóricas de eficiencia** que sirven de
+referencia, distintas para CPU y GPU porque cada hardware expone el paralelismo en un eje
+diferente: la CPU barre **procesadores $p$** a tamaño fijo, mientras que la única GPU barre el
+**tamaño del problema $M$** con $p = 1$.
+
+## Eficiencia teórica: curvas de referencia
+
+### CPU: modelo de contención de ancho de banda de memoria
+
+El análisis PRAM predice $T_p = O(NDYh/p + \log(Yh))$ para el entrenamiento (con $B \ge 4p$, de
+modo que $\min(p,B)=p$). Si la pérdida de eficiencia se debiera a un sobrecosto fijo aditivo, la
+eficiencia *mejoraría* al crecer $N$; las mediciones muestran lo contrario (las curvas de tres
+tamaños se superponen), de modo que el recurso limitante se consume en proporción al trabajo y
+es **compartido** por los $p$ núcleos: el bus de memoria. Si cada unidad de trabajo requiere
+tiempo de cómputo $t_c$ y mueve $q$ bytes por un bus de ancho de banda $\beta$, entonces
+(@eq-ecpu)
+
+$$
+T_p = \underbrace{\frac{W t_c}{p}}_{\text{cómputo, repartido}}
+    + \underbrace{\frac{W q}{\beta}}_{\text{bus, no repartido}},
+\qquad
+E(p) = \frac{1+\gamma}{1+\gamma p}, \quad \gamma = \frac{q/\beta}{t_c}.
+$$ {#eq-ecpu}
+
+El trabajo $W = NDYh$ **se cancela**: un único $\gamma$ describe todos los tamaños (justo la
+superposición observada). Asintóticamente $E(p) = O(1/p)$ y la aceleración satura en
+$S(\infty) = 1 + 1/\gamma$. Un ajuste por mínimos cuadrados sobre los tres tamaños dio
+$\gamma \approx 0.063$ (los fallos de memoria cuestan ~6 % del tiempo de cómputo por unidad de
+trabajo) y $S(\infty) \approx 17$.
+
+### GPU: la curva teórica cuando $p = 1$
+
+El estudio de GPU no tiene eje de procesadores ($p_{GPU}=1$): el eje es el tamaño
+$M = N\cdot 366$ ajustes, y una línea de "eficiencia ideal" no aplica. Como todas las etapas
+están muy por debajo del vértice del *roofline* (intensidad aritmética $I \approx 0.08$–$0.6$
+FLOP/byte frente a un vértice $\approx 6.6$), cada etapa está **limitada por ancho de banda** y
+su tiempo tiene como cota inferior el tiempo de mover sus bytes (@eq-egpu):
+
+$$
+T_{\text{bound}}(M) = \frac{Q(M)}{\beta},
+\qquad
+\eta(M) = \frac{T_{\text{bound}}(M)}{T_{\text{med}}(M)}
+        = \frac{\text{GB/s alcanzados}}{\beta} \in (0,1].
+$$ {#eq-egpu}
+
+La **utilización de ancho de banda** $\eta(M)$ es el análogo de la eficiencia para una sola
+GPU: con un costo fijo de lanzamiento $t_0$, $T(M) \approx t_0 + Q(M)/\beta$ y $\eta(M) \to 1$
+al crecer $M$ (el lote llena el dispositivo). Es la imagen especular del caso CPU: allí la
+eficiencia *decae* como $O(1/p)$ por contención; aquí la utilización *satura* al crecer el lote,
+y por eso la GPU prefiere buckets **grandes**.
+
+## Granularidad de oleadas: cuántos ajustes corren a la vez
+
+El *solve* por lotes no ejecuta los $M$ ajustes simultáneamente; el hardware los corre en
+**oleadas** (*waves*), y las mediciones bastan para contarlas:
+
+1. El kernel usa **un hilo por ajuste** y necesita **127 registros por hilo** (un *registro* es
+   el almacenamiento privado y rápido de un hilo; aquí guarda el sistema $5\times5$ y los
+   intermedios de Cholesky). Este número lo elige el compilador de CUDA y se registra en la
+   columna `num_regs` de `gpu_kernel.csv`.
+2. Los hilos se planifican en **warps** de 32, así que un warp necesita
+   $32 \times 127 \approx 4\,064$ registros, redondeados a $4\,096$.
+3. Cada SM posee $65\,536$ registros, de modo que $65\,536 / 4\,096 = 16$ warps $= 512$ hilos
+   caben por SM (limitado por registros al 25 % del máximo nominal de 2048 hilos/SM).
+4. La partición MIG tiene **42 SM**, así que el dispositivo mantiene
+   $42 \times 512 = 21\,504$ ajustes en vuelo, y $\text{oleadas}(M) = \lceil M / 21\,504 \rceil$.
+
+| $M$ (ajustes) | oleadas | tiempo *solve* (ms) | µs por oleada |
+|--:|--:|--:|--:|
+| 23 424 | 2 | 0.0266 | 13.3 |
+| 107 238 | 5 | 0.0727 | 14.5 |
+| 187 392 | 9 | 0.1065 | 11.8 |
+| 374 784 | 18 | 0.1915 | 10.6 |
+| 800 000 | 38 | 0.3835 | 10.1 |
+
+: Oleadas del kernel *solve* en la partición A100 MIG. {#tbl-oleadas}
+
+El tiempo por oleada converge a $\approx 10$ µs al crecer $M$ (los valores mayores a $M$
+pequeño son el costo de lanzamiento $t_0$), y $21\,504$ ajustes cada 10 µs reproducen el
+rendimiento saturado medido de $\approx 2\times10^9$ ajustes/s. A escala completa, el dominio de
+300 000 `ID`s ($M_{\text{total}} \approx 1.1\times10^8$ ajustes) corrió unas **5 150 oleadas**
+de *solve* en total, $\approx 5$ por bucket de $B=1024$. No hace falta un gráfico de "oleadas vs
+$M$": es la recta $M/21\,504$ por construcción; la evidencia visual está en la curva de tiempo
+vs $M$, que crece linealmente por encima de una oleada.
+
+## Resultados en CPU (Trabajo A)
+
+Se midió el escalamiento fuerte del entrenamiento en tres tamaños de problema
+(512 / 1024 / 2048 `ID`s), con $p \in \{1,2,4,8,16,32\}$ y $B \ge 4p$. La @tbl-cpu recoge la
+eficiencia $E(p)$: las tres curvas son casi indistinguibles, la firma de una carga
+**independiente del tamaño** y limitada por ancho de banda de memoria; la última columna es la
+curva teórica ajustada de la @eq-ecpu con $\gamma = 0.063$.
+
+| $p$ | $E(p)$, N=512 | $E(p)$, N=1024 | $E(p)$, N=2048 | $E(p)$ teórico |
+|--:|--:|--:|--:|--:|
+| 1  | 1.000 | 1.000 | 1.000 | 1.000 |
+| 2  | 0.939 | 0.917 | 0.912 | 0.944 |
+| 4  | 0.830 | 0.826 | 0.824 | 0.849 |
+| 8  | 0.709 | 0.704 | 0.699 | 0.707 |
+| 16 | 0.562 | 0.560 | 0.557 | 0.529 |
+| 32 | 0.345 | 0.342 | 0.337 | 0.352 |
+
+: Eficiencia $E(p)$ del entrenamiento por tamaño de problema, con la curva teórica del modelo de
+contención. {#tbl-cpu}
+
+El rendimiento por núcleo es constante (~2.0 s/`ID` en un núcleo, independiente del tamaño), de
+modo que el tiempo es lineal en el problema. La eficiencia se mantuvo alta hasta ~4–8 núcleos y
+luego cayó —no por desbalance ni sobrecosto fijo (un problema mayor los diluiría), sino porque
+todos los núcleos compiten por el **mismo bus de memoria**—: la eficiencia de escalamiento débil
+a 32 núcleos ($\approx 0.35$) coincide con la de escalamiento fuerte a 32, firma de una carga
+**limitada por ancho de banda**. El modelo $E(p)=(1+\gamma)/(1+\gamma p)$ con $\gamma \approx
+0.063$ reproduce las mediciones dentro de pocos puntos porcentuales. El punto óptimo práctico es
+**$p \approx 8$** (eficiencia $\approx 0.70$); 32 núcleos dan el mejor tiempo de pared pero a
+aproximadamente un tercio de la eficiencia, con una aceleración que sigue trepando hacia el
+techo $S(\infty) \approx 17$ (medida $\approx 11\times$ a $p=32$).
+
+## Resultados en GPU (Trabajo B)
+
+Sobre una sola partición A100 MIG (`a100_3g.20gb`), el pipeline de entrenamiento tiene tres
+etapas —**assemble** (dispersa filas en estadísticos suficientes $5\times5$), **convolve**
+($2h+1$ desplazamientos circulares ponderados sobre el día del año) y **solve** (el kernel
+Cholesky $5\times5$ de un hilo por ajuste)—. La @tbl-gpu resume el desempeño de un dispositivo.
+
+| Magnitud | Valor |
+|:--|:--|
+| Ancho de banda HBM medido | **633 GB/s** |
+| Pico FP64 (partición) | 4200 GFLOPS (vértice AI $\approx 6.6$) |
+| Mejor hilos/bloque | 32 ($1.81\times10^9$ ajustes/s) |
+| Rendimiento del *solve* | hasta $2.09\times10^9$ ajustes/s |
+| Intensidad aritmética por etapa | assemble 0.11 · convolve 0.08 · solve 0.61 (todas $\ll 6.6$) |
+| Entrenamiento completo 300 000 puntos | **879.7 s ($\approx 14.7$ min)** |
+
+: Desempeño de la GPU en un solo dispositivo. {#tbl-gpu}
+
+Todas las etapas se sitúan muy por debajo del vértice del *roofline*, por lo que el pipeline
+está **limitado por ancho de banda, no por cómputo** —lo esperable para estos sistemas lineales
+diminutos—. Aun así, el rendimiento bruto es enorme ($\approx 2\times10^9$ ajustes/s) y el
+dominio completo de 300 000 puntos se entrenó en menos de 15 minutos. La curva de tiempo vs $M$
+crece linealmente por encima de una oleada, y su cota teórica es el piso de ancho de banda
+$T_{\text{bound}} = Q(M)/\beta$ de la @eq-egpu.
+
+**CPU frente a GPU.** Sobre una base de costo por `ID` entrenado: CPU 1 núcleo
+$\approx 2.0$ s/`ID` ($1\times$), CPU 32 núcleos $\approx 0.18$ s/`ID` ($\approx 11\times$) y GPU
+$\approx 0.0029$ s/`ID` ($\approx 670\times$). Es decir, para el **entrenamiento**, la GPU fue
+$\approx 60\times$ más rápida que un nodo CPU de 32 núcleos plenamente cargado. El
+**pronóstico**, en cambio, es autorregresivo (cada día predicho alimenta los rezagos del
+siguiente), inherentemente secuencial y en Python/pandas puro, por lo que la GPU **no lo
+acelera**; solo queda paralelizarlo entre `ID`s independientes en CPU.
+
+## Comparación PISCOt v1.1 vs v1.2 (Trabajo C)
+
+Sobre el pronóstico retenido de 2015 (20 000 `ID`s, ~7.3 millones de valores diarios evaluados
+contra la TD observada), ambas versiones producen modelos muy similares (@tbl-acc).
+
+| Corrida | RMSE | MAE | Sesgo (pred−obs) | Pearson $r$ | Coseno |
+|:--|--:|--:|--:|--:|--:|
+| **v1.1** | **1.127** | **0.844** | +0.443 | **0.9823** | 0.9926 |
+| **v1.2** | 1.136 | 0.867 | **+0.143** | 0.9787 | 0.9921 |
+
+: Habilidad del pronóstico frente a la TD observada; $\Delta$RMSE (v1.2−v1.1) $= +0.0089$
+(~0.8 %). {#tbl-acc}
+
+Ambas versiones dan idéntica cobertura (7.32 M ajustes) y modelos muy parecidos: la mayor
+diferencia está en la **sensibilidad a la anomalía de TMIN** (`TMIN_anom_coeff`: v1.1 = 0.452 vs
+v1.2 = 0.370; la de menor correlación, $r = 0.68$), y v1.2 se apoya algo más en la persistencia
+autorregresiva (`TD_anom_lag1` 0.81 vs 0.78). La calidad de ajuste es casi idéntica ($R^2$ 0.787
+vs 0.778) y las predicciones de ambas versiones concuerdan estrechamente entre sí (RMSE 0.61,
+$r$ 0.9946), divergiendo más en septiembre–octubre. En resumen, **v1.1 tiene un error
+marginalmente menor** (RMSE 1.127 vs 1.136, ~0.8 %) mientras que **v1.2 está mucho mejor
+centrada** (sesgo +0.14 vs +0.44): prácticamente un empate en magnitud, con un compromiso real
+entre dispersión (mejor en v1.1) y sesgo (mejor en v1.2). Cuál versión es "mejor" depende de esa
+prioridad y **debe validarse con un experto temático** sobre una evaluación multianual de
+dominio completo (esta es una muestra de 20 000 `ID`s para un único año de pronóstico).
+
+## Recomendación
+
+Los resultados confirman punto por punto el modelo teórico. La recomendación práctica es **usar
+cada hardware según la etapa**: la GPU para el **entrenamiento** (parte compute-intensiva y
+masivamente paralela; una sola partición A100 MIG entrena el dominio de 300 000 puntos en
+~15 min) y la CPU para el **pronóstico** (recurrencia secuencial que la GPU no acelera,
+paralelizable en cambio entre `ID`s). Si no hay GPU, el entrenamiento corre en CPU con **~8
+núcleos** para la mejor eficiencia ($\approx 0.70$), o hasta 32 para el mejor tiempo de pared
+(eficiencia $\approx 0.34$, limitada por ancho de banda de memoria).
+
+# Contribución
+
+| Nombre | Porcentaje |
+|:--|:--:|
+| Piero Palacios Bernuy | 100% |
+| Estuardo Oliver Campos | 100% |
+| Diego Sánchez Salazar | 100% |
+| Gianmarco Mejía | 100% |
+
+# Referencias {.unnumbered}
+
+::: {#refs}
+:::
+
+{{< pagebreak >}}
+
+```{=typst}
+#set heading(numbering: (..n) => {
+  let p = n.pos()
+  if p.len() == 1 { "Apéndice " + numbering("A", p.at(0)) + "." } else { numbering("A.1.1.1", ..p) }
+})
+#counter(heading).update(0)
+```
+
+# Pseudocódigo PRAM y análisis de complejidad completos
+
+Este apéndice reproduce de forma íntegra el documento técnico de pseudocódigo en el modelo
+PRAM y el análisis de complejidad del pipeline. Detalla los nueve algoritmos (climatología,
+construcción del dataset bucket-año, fragmentación, entrenamiento de coeficientes,
+verificación de completitud, reparación, parchado y pronóstico), con sus costos de trabajo
+secuencial $W$, tiempo paralelo $T_p$ y span $T_\infty$, así como la interpretación para
+cómputo de alto desempeño (HPC) y la metodología experimental completa. Las secciones del
+apéndice se numeran A.1, A.2, …
+
+{{< include pram_appendix.qmd >}}
